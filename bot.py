@@ -52,7 +52,7 @@ if not all([BOT_TOKEN, GIGA_AUTH, YOOKASSA_ID, YOOKASSA_KEY]):
 Configuration.account_id = YOOKASSA_ID
 Configuration.secret_key = YOOKASSA_KEY
 
-# ===== РАЗМЕРЫ СЛАЙДА (13.333" x 7.5") =====
+# ===== РАЗМЕРЫ СЛАЙДА =====
 SW = Emu(12192000)
 SH = Emu(6858000)
 MG = Emu(365760)
@@ -108,10 +108,69 @@ def pay_kb(url):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
+# ===== ПАРСИНГ JSON ИЗ ОТВЕТА =====
+def extract_json(text):
+    """Извлекает JSON из любого текста, чинит битые строки."""
+    if not text:
+        return None
+    
+    # Убираем всё до первой {
+    start = text.find('{')
+    if start == -1:
+        return None
+    
+    # Убираем всё после последней }
+    end = text.rfind('}')
+    if end == -1 or end <= start:
+        return None
+    
+    json_str = text[start:end+1]
+    
+    # ЧИНИМ БИТЫЙ JSON:
+    # 1. Убираем переносы строк ВНУТРИ строк (между кавычками)
+    # 2. Экранируем неэкранированные кавычки внутри строк
+    # 3. Убираем запятые перед закрывающими скобками
+    
+    # Убираем лишние пробелы и переносы строк ВНЕ строк
+    in_string = False
+    cleaned = []
+    i = 0
+    while i < len(json_str):
+        c = json_str[i]
+        if c == '"' and (i == 0 or json_str[i-1] != '\\'):
+            in_string = not in_string
+            cleaned.append(c)
+        elif c == '\n' and in_string:
+            cleaned.append('\\n')  # Экранируем перенос строки внутри строки
+        elif c == '\r' and in_string:
+            cleaned.append('')  # Пропускаем \r внутри строки
+        elif c == '\t' and in_string:
+            cleaned.append(' ')  # Заменяем табуляцию на пробел внутри строки
+        else:
+            cleaned.append(c)
+        i += 1
+    
+    json_str = ''.join(cleaned)
+    
+    # Убираем запятые перед } или ]
+    json_str = re.sub(r',\s*}', '}', json_str)
+    json_str = re.sub(r',\s*]', ']', json_str)
+    
+    # Убираем лишние запятые (две подряд)
+    json_str = re.sub(r',\s*,', ',', json_str)
+    
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        log.error(f"JSON error после чистки: {e}")
+        log.error(f"Проблемный участок: {json_str[max(0,e.pos-50):e.pos+50]}")
+        return None
+
 # ===== GIGACHAT =====
 async def ask_ai(text, temp=0.75):
     token = await get_token()
-    if not token: return None
+    if not token:
+        return None
 
     for attempt in range(3):
         try:
@@ -122,17 +181,20 @@ async def ask_ai(text, temp=0.75):
                     json={
                         "model": "GigaChat",
                         "messages": [
-                            {"role": "system", "content": "Ты — профессор. Объясняешь сложные темы на пальцах, с яркими примерами и метафорами."},
+                            {"role": "system", "content": "Ты — профессор. Объясняешь сложные темы на пальцах, с яркими примерами и метафорами. Отвечай СТРОГО в формате JSON без лишнего текста."},
                             {"role": "user", "content": text}
                         ],
-                        "temperature": temp, "max_tokens": 3500
+                        "temperature": temp,
+                        "max_tokens": 3500
                     }, ssl=False, timeout=90
                 ) as r:
                     if r.status == 200:
                         return (await r.json())["choices"][0]["message"]["content"]
                     if r.status == 429:
                         await asyncio.sleep(2 ** attempt)
-        except: await asyncio.sleep(1)
+        except Exception as e:
+            log.warning(f"GigaChat попытка {attempt+1}: {e}")
+            await asyncio.sleep(1)
     return None
 
 async def get_content(topic, n):
@@ -141,101 +203,85 @@ async def get_content(topic, n):
 СТРУКТУРА:
 Слайд 1: Титульный (название темы, "Москва, 2026")
 Слайды 2-{n-1}: Содержательные слайды. Для КАЖДОГО напиши:
-  - "title": Яркий заголовок (5-9 слов), вызывающий интерес
-  - "text": 3-4 развёрнутых предложения с КОНКРЕТНЫМИ ПРИМЕРАМИ ИЗ ЖИЗНИ, цифрами, фактами
-  - "image_prompt": Короткое описание картинки НА АНГЛИЙСКОМ ЯЗЫКЕ (3-6 слов).
-    ВАЖНО: Каждый image_prompt должен быть УНИКАЛЬНЫМ и соответствовать тексту слайда.
-    Примеры:
-    "colorful DNA double helix structure"
-    "microscope view of human cell"
-    "friendly bacteria in human gut"
-    "quantum wave function visualization"
-    "cartoon characters learning together"
+  - "title": Яркий заголовок (5-9 слов)
+  - "text": 3-4 предложения с КОНКРЕТНЫМИ ПРИМЕРАМИ
+  - "image_prompt": Короткое описание картинки НА АНГЛИЙСКОМ (3-6 слов).
+    Каждый image_prompt должен быть УНИКАЛЬНЫМ.
+    Примеры: "colorful DNA double helix", "microscope view of cell", "bacteria in human gut"
 
 Слайд {n}: Список литературы (5 реальных книг/статей)
 
-ФОРМАТ ОТВЕТА — ТОЛЬКО JSON:
+ОТВЕТ — ТОЛЬКО ВАЛИДНЫЙ JSON, БЕЗ КОММЕНТАРИЕВ:
 {{
-  "title": "Заголовок всей презентации",
+  "title": "Заголовок презентации",
   "slides": [
     {{"type": "title", "text": "Москва, 2026"}},
-    {{"type": "content", "title": "Заголовок слайда", "text": "Текст с примерами...", "image_prompt": "english description of image"}},
-    ...
-    {{"type": "references", "text": "1. Книга 1\\n2. Книга 2\\n..."}}
+    {{"type": "content", "title": "Заголовок", "text": "Текст...", "image_prompt": "english words"}},
+    {{"type": "references", "text": "1. Книга\\\\n2. Статья"}}
   ]
 }}
+
+ПРАВИЛА:
+1. ВСЕ кавычки внутри текста должны быть экранированы: \\"
+2. Никаких переносов строк внутри текстовых полей
+3. Только ОДИН JSON-объект в ответе
 """
-    resp = await ask_ai(prompt, temp=0.8)
-    if not resp: return None
-
-    s = resp.find('{')
-    e = resp.rfind('}')
-    if s == -1 or e == -1:
-        log.error("JSON не найден")
+    resp = await ask_ai(prompt, temp=0.7)
+    if not resp:
+        log.error("GigaChat не ответил")
         return None
 
-    try:
-        data = json.loads(resp[s:e+1])
-    except json.JSONDecodeError:
-        log.error("JSON decode error")
-        return None
-
-    if "slides" not in data:
+    log.info(f"Ответ GigaChat ({len(resp)} символов)")
+    
+    # Извлекаем и чиним JSON
+    data = extract_json(resp)
+    if not data:
+        # Пробуем ещё раз с другой температурой
+        log.warning("Первая попытка парсинга не удалась, пробую ещё раз...")
+        resp2 = await ask_ai(prompt, temp=0.5)
+        if resp2:
+            data = extract_json(resp2)
+    
+    if not data:
+        log.error("Все попытки парсинга JSON не удались")
         return None
     
+    if "slides" not in data:
+        log.error("Нет поля slides в ответе")
+        return None
+    
+    # Проверяем, что slides — это список
+    if not isinstance(data["slides"], list):
+        log.error("slides не является списком")
+        return None
+    
+    log.info(f"Успешно получено {len(data['slides'])} слайдов")
     return data
 
-# ===== КАРТИНКИ (ИСПРАВЛЕНО!) =====
+# ===== КАРТИНКИ =====
 async def get_image(prompt):
-    """Генерирует картинку через Pollinations AI с повторными попытками."""
     if not prompt:
         return None
     
-    # Очищаем промпт
     safe = re.sub(r'[^a-zA-Z0-9\s]', '', prompt).strip()
     if not safe or len(safe) < 3:
         safe = "abstract presentation background"
     
-    # Кодируем для URL
     encoded = safe.replace(' ', '%20')
     seed = str(uuid.uuid4().int)[:8]
     
-    # Пробуем ДВА разных URL для надёжности
-    urls = [
-        f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}",
-        f"https://pollinations.ai/p/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
-    ]
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
     
-    for url in urls:
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=25) as r:
-                    if r.status == 200:
-                        content_type = r.headers.get('Content-Type', '')
-                        if 'image' in content_type or len(await r.read()) > 1000:
-                            return BytesIO(await r.read() if hasattr(r, '_body') else (await r.read()))
-                        
-                        # Второй вариант чтения
-                        data = await r.read()
-                        if len(data) > 1000:
-                            return BytesIO(data)
-        except Exception as e:
-            log.warning(f"URL {url[:50]}... не сработал: {e}")
-            continue
-    
-    # Если не сработало — пробуем Unsplash (заглушка)
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"https://source.unsplash.com/1024x768/?{encoded}",
-                timeout=15
-            ) as r:
+            async with s.get(url, timeout=30) as r:
                 if r.status == 200:
-                    return BytesIO(await r.read())
-    except:
-        pass
+                    data = await r.read()
+                    if len(data) > 1000:
+                        return BytesIO(data)
+    except Exception as e:
+        log.warning(f"Картинка: {e}")
     
-    log.warning(f"Все сервисы картинок не ответили для: {safe[:50]}")
     return None
 
 # ===== PPTX =====
@@ -248,11 +294,10 @@ async def make_pptx(data):
     prs.slide_width = SW
     prs.slide_height = SH
 
-    # Готовим картинки параллельно
     tasks = []
     for s in slides:
         if s.get("type") == "content":
-            prompt = s.get("image_prompt", s.get("caption", ""))
+            prompt = s.get("image_prompt", "")
             tasks.append(get_image(prompt))
         else:
             tasks.append(asyncio.sleep(0))
@@ -304,18 +349,14 @@ async def make_pptx(data):
                 for p in tf.paragraphs:
                     p.font.size = Pt(15)
                     p.space_after = Pt(8)
-                    p.alignment = PP_ALIGN.LEFT
 
-                # Картинка
                 img_top = Emu(1800000)
                 img = images[i]
                 
                 if isinstance(img, BytesIO):
                     try:
                         sl.shapes.add_picture(img, img_left, img_top, width=IW)
-                        
-                        # Подпись
-                        caption = s.get("image_prompt", s.get("caption", "Иллюстрация"))
+                        caption = s.get("image_prompt", "Иллюстрация")
                         cap_top = img_top + Emu(3700000)
                         cap = sl.shapes.add_textbox(img_left, cap_top, IW, Emu(400000))
                         cap.text_frame.text = caption
@@ -325,9 +366,17 @@ async def make_pptx(data):
                             p.alignment = PP_ALIGN.CENTER
                     except Exception as e:
                         log.error(f"Вставка картинки {i}: {e}")
-                        _add_image_placeholder(sl, img_left, img_top, IW)
                 else:
-                    _add_image_placeholder(sl, img_left, img_top, IW)
+                    # Красивая заглушка
+                    shape = sl.shapes.add_shape(1, img_left, img_top, IW, Emu(3600000))
+                    shape.fill.solid()
+                    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
+                    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
+                    shape.line.width = Pt(1)
+                    shape.text_frame.text = "🖼️\nИллюстрация"
+                    for p in shape.text_frame.paragraphs:
+                        p.alignment = PP_ALIGN.CENTER
+                        p.font.size = Pt(13)
 
         except Exception as e:
             log.error(f"Слайд {i}: {e}")
@@ -337,21 +386,6 @@ async def make_pptx(data):
     prs.save(buf)
     buf.seek(0)
     return buf
-
-def _add_image_placeholder(slide, left, top, width):
-    """Красивая заглушка если картинка не загрузилась."""
-    shape = slide.shapes.add_shape(1, left, top, width, Emu(3600000))
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
-    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
-    shape.line.width = Pt(1)
-    
-    tf = shape.text_frame
-    tf.text = "🖼️\nИллюстрация\nк слайду"
-    for p in tf.paragraphs:
-        p.alignment = PP_ALIGN.CENTER
-        p.font.size = Pt(13)
-        p.font.color.rgb = type(p.font.color).rgb = (140, 140, 160)
 
 # ===== ИМЯ ФАЙЛА =====
 def filename(topic):
@@ -431,14 +465,13 @@ async def got_topic(msg: Message, state: FSMContext):
     
     await state.update_data(topic=topic, num=n)
     
-    # АДМИН — БЕСПЛАТНО
     if msg.from_user.id == ADMIN_ID:
         await state.clear()
         status = await msg.answer(f"🔄 Генерирую «{topic}», {n} слайдов...")
         try:
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
             if not data:
-                return await status.edit_text("❌ GigaChat не ответил")
+                return await status.edit_text("❌ GigaChat не ответил. Попробуй другую тему.")
             await status.edit_text("🎨 Создаю слайды...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=120)
             if not pptx:
@@ -452,7 +485,6 @@ async def got_topic(msg: Message, state: FSMContext):
             log.error(f"Ошибка: {e}")
             await status.edit_text("❌ Ошибка. /start")
     else:
-        # ПЛАТНО
         try:
             payment = Payment.create({
                 "amount": {"value": f"{PRICE}.00", "currency": "RUB"},
