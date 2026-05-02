@@ -1,7 +1,7 @@
-import asyncio, os, re, json, uuid, base64, time, logging, sys
+import asyncio, os, re, json, uuid, base64, time, logging, sys, random
 from io import BytesIO
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from pathlib import Path
 
 import aiohttp
@@ -43,6 +43,7 @@ GIGA_AUTH = base64.b64encode(
 ).decode()
 YOOKASSA_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+PIXABAY_KEY = os.getenv("PIXABAY_API_KEY", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PRICE = 100
 
@@ -108,62 +109,40 @@ def pay_kb(url):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
-# ===== ПАРСИНГ JSON ИЗ ОТВЕТА =====
+# ===== ПАРСИНГ JSON =====
 def extract_json(text):
-    """Извлекает JSON из любого текста, чинит битые строки."""
     if not text:
         return None
-    
-    # Убираем всё до первой {
     start = text.find('{')
-    if start == -1:
-        return None
-    
-    # Убираем всё после последней }
     end = text.rfind('}')
-    if end == -1 or end <= start:
+    if start == -1 or end == -1 or end <= start:
         return None
-    
     json_str = text[start:end+1]
     
-    # ЧИНИМ БИТЫЙ JSON:
-    # 1. Убираем переносы строк ВНУТРИ строк (между кавычками)
-    # 2. Экранируем неэкранированные кавычки внутри строк
-    # 3. Убираем запятые перед закрывающими скобками
-    
-    # Убираем лишние пробелы и переносы строк ВНЕ строк
     in_string = False
     cleaned = []
-    i = 0
-    while i < len(json_str):
-        c = json_str[i]
-        if c == '"' and (i == 0 or json_str[i-1] != '\\'):
+    for c in json_str:
+        if c == '"':
             in_string = not in_string
             cleaned.append(c)
         elif c == '\n' and in_string:
-            cleaned.append('\\n')  # Экранируем перенос строки внутри строки
+            cleaned.append('\\n')
         elif c == '\r' and in_string:
-            cleaned.append('')  # Пропускаем \r внутри строки
+            continue
         elif c == '\t' and in_string:
-            cleaned.append(' ')  # Заменяем табуляцию на пробел внутри строки
+            cleaned.append(' ')
         else:
             cleaned.append(c)
-        i += 1
-    
     json_str = ''.join(cleaned)
     
-    # Убираем запятые перед } или ]
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
-    
-    # Убираем лишние запятые (две подряд)
     json_str = re.sub(r',\s*,', ',', json_str)
     
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
-        log.error(f"JSON error после чистки: {e}")
-        log.error(f"Проблемный участок: {json_str[max(0,e.pos-50):e.pos+50]}")
+        log.error(f"JSON error: {e}")
         return None
 
 # ===== GIGACHAT =====
@@ -181,11 +160,10 @@ async def ask_ai(text, temp=0.75):
                     json={
                         "model": "GigaChat",
                         "messages": [
-                            {"role": "system", "content": "Ты — профессор. Объясняешь сложные темы на пальцах, с яркими примерами и метафорами. Отвечай СТРОГО в формате JSON без лишнего текста."},
+                            {"role": "system", "content": "Ты — профессор. Объясняешь сложное на пальцах. Отвечай ТОЛЬКО валидным JSON."},
                             {"role": "user", "content": text}
                         ],
-                        "temperature": temp,
-                        "max_tokens": 3500
+                        "temperature": temp, "max_tokens": 3500
                     }, ssl=False, timeout=90
                 ) as r:
                     if r.status == 200:
@@ -193,7 +171,7 @@ async def ask_ai(text, temp=0.75):
                     if r.status == 429:
                         await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            log.warning(f"GigaChat попытка {attempt+1}: {e}")
+            log.warning(f"GigaChat {attempt+1}: {e}")
             await asyncio.sleep(1)
     return None
 
@@ -201,86 +179,124 @@ async def get_content(topic, n):
     prompt = f"""Создай учебную презентацию на тему "{topic}". Ровно {n} слайдов.
 
 СТРУКТУРА:
-Слайд 1: Титульный (название темы, "Москва, 2026")
-Слайды 2-{n-1}: Содержательные слайды. Для КАЖДОГО напиши:
+Слайд 1: Титульный (тема, "Москва, 2026")
+Слайды 2-{n-1}: Содержательные:
   - "title": Яркий заголовок (5-9 слов)
-  - "text": 3-4 предложения с КОНКРЕТНЫМИ ПРИМЕРАМИ
-  - "image_prompt": Короткое описание картинки НА АНГЛИЙСКОМ (3-6 слов).
-    Каждый image_prompt должен быть УНИКАЛЬНЫМ.
-    Примеры: "colorful DNA double helix", "microscope view of cell", "bacteria in human gut"
+  - "text": 3-4 предложения с ПРИМЕРАМИ
+  - "search_query": 1-3 ключевых слова на русском для поиска фото по теме слайда.
+    Примеры: "ДНК молекула", "клетка микроскоп", "нейроны мозга", "планеты солнечной системы"
 
 Слайд {n}: Список литературы (5 реальных книг/статей)
 
-ОТВЕТ — ТОЛЬКО ВАЛИДНЫЙ JSON, БЕЗ КОММЕНТАРИЕВ:
+ОТВЕТ — ТОЛЬКО JSON:
 {{
   "title": "Заголовок презентации",
   "slides": [
     {{"type": "title", "text": "Москва, 2026"}},
-    {{"type": "content", "title": "Заголовок", "text": "Текст...", "image_prompt": "english words"}},
-    {{"type": "references", "text": "1. Книга\\\\n2. Статья"}}
+    {{"type": "content", "title": "...", "text": "...", "search_query": "ключевые слова на русском"}},
+    {{"type": "references", "text": "1. ...\\\\n2. ..."}}
   ]
 }}
-
-ПРАВИЛА:
-1. ВСЕ кавычки внутри текста должны быть экранированы: \\"
-2. Никаких переносов строк внутри текстовых полей
-3. Только ОДИН JSON-объект в ответе
 """
     resp = await ask_ai(prompt, temp=0.7)
     if not resp:
-        log.error("GigaChat не ответил")
         return None
 
-    log.info(f"Ответ GigaChat ({len(resp)} символов)")
-    
-    # Извлекаем и чиним JSON
     data = extract_json(resp)
     if not data:
-        # Пробуем ещё раз с другой температурой
-        log.warning("Первая попытка парсинга не удалась, пробую ещё раз...")
         resp2 = await ask_ai(prompt, temp=0.5)
         if resp2:
             data = extract_json(resp2)
     
-    if not data:
-        log.error("Все попытки парсинга JSON не удались")
+    if not data or "slides" not in data:
         return None
     
-    if "slides" not in data:
-        log.error("Нет поля slides в ответе")
-        return None
-    
-    # Проверяем, что slides — это список
-    if not isinstance(data["slides"], list):
-        log.error("slides не является списком")
-        return None
-    
-    log.info(f"Успешно получено {len(data['slides'])} слайдов")
+    log.info(f"Получено {len(data['slides'])} слайдов")
     return data
 
-# ===== КАРТИНКИ =====
-async def get_image(prompt):
-    if not prompt:
-        return None
+# ===== PIXABAY API =====
+async def pixabay_search(query: str, count: int = 5) -> List[str]:
+    """Ищет фото на Pixabay, возвращает список URL (largeImageURL)."""
+    if not PIXABAY_KEY:
+        log.warning("Нет Pixabay API ключа!")
+        return []
     
-    safe = re.sub(r'[^a-zA-Z0-9\s]', '', prompt).strip()
-    if not safe or len(safe) < 3:
-        safe = "abstract presentation background"
-    
-    encoded = safe.replace(' ', '%20')
-    seed = str(uuid.uuid4().int)[:8]
-    
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
+    params = {
+        "key": PIXABAY_KEY,
+        "q": query,
+        "per_page": min(count, 20),  # Максимум 20 за запрос
+        "orientation": "horizontal",
+        "min_width": 1024,
+        "min_height": 768,
+        "safesearch": "true",
+        "image_type": "photo",
+        "order": "popular"
+    }
     
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=30) as r:
+            async with s.get(
+                "https://pixabay.com/api/",
+                params=params, timeout=15
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    hits = data.get("hits", [])
+                    urls = [h["largeImageURL"] for h in hits if "largeImageURL" in h]
+                    log.info(f"Pixabay: {len(urls)} фото по '{query}'")
+                    return urls
+                elif r.status == 429:
+                    log.warning("Pixabay rate limit")
+                else:
+                    log.error(f"Pixabay: {r.status}")
+    except Exception as e:
+        log.error(f"Pixabay ошибка: {e}")
+    
+    return []
+
+async def download_image(url: str) -> Optional[BytesIO]:
+    """Скачивает фото по URL."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
                 if r.status == 200:
                     data = await r.read()
                     if len(data) > 1000:
                         return BytesIO(data)
     except Exception as e:
-        log.warning(f"Картинка: {e}")
+        log.warning(f"Скачивание: {e}")
+    return None
+
+async def get_image(query: str) -> Optional[BytesIO]:
+    """Получает фото: Pixabay → Pollinations AI (запасной)."""
+    # 1. Пробуем Pixabay
+    if PIXABAY_KEY:
+        urls = await pixabay_search(query)
+        if urls:
+            url = random.choice(urls)
+            img = await download_image(url)
+            if img:
+                return img
+    
+    # 2. Запасной — Pollinations AI
+    safe = re.sub(r'[^a-zA-Zа-яА-Я0-9\s]', '', query).strip()
+    if not safe:
+        safe = "abstract presentation"
+    encoded = safe.replace(' ', '%20')
+    
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://image.pollinations.ai/prompt/{encoded}",
+                params={"width": 1024, "height": 768, "nologo": "true", "seed": str(uuid.uuid4().int)[:8]},
+                timeout=25
+            ) as r:
+                if r.status == 200:
+                    data = await r.read()
+                    if len(data) > 1000:
+                        return BytesIO(data)
+    except:
+        pass
     
     return None
 
@@ -297,8 +313,8 @@ async def make_pptx(data):
     tasks = []
     for s in slides:
         if s.get("type") == "content":
-            prompt = s.get("image_prompt", "")
-            tasks.append(get_image(prompt))
+            query = s.get("search_query", s.get("image_prompt", ""))
+            tasks.append(get_image(query))
         else:
             tasks.append(asyncio.sleep(0))
     images = await asyncio.gather(*tasks, return_exceptions=True)
@@ -356,7 +372,7 @@ async def make_pptx(data):
                 if isinstance(img, BytesIO):
                     try:
                         sl.shapes.add_picture(img, img_left, img_top, width=IW)
-                        caption = s.get("image_prompt", "Иллюстрация")
+                        caption = s.get("search_query", s.get("image_prompt", "Иллюстрация"))
                         cap_top = img_top + Emu(3700000)
                         cap = sl.shapes.add_textbox(img_left, cap_top, IW, Emu(400000))
                         cap.text_frame.text = caption
@@ -366,17 +382,9 @@ async def make_pptx(data):
                             p.alignment = PP_ALIGN.CENTER
                     except Exception as e:
                         log.error(f"Вставка картинки {i}: {e}")
+                        _add_placeholder(sl, img_left, img_top, IW)
                 else:
-                    # Красивая заглушка
-                    shape = sl.shapes.add_shape(1, img_left, img_top, IW, Emu(3600000))
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
-                    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
-                    shape.line.width = Pt(1)
-                    shape.text_frame.text = "🖼️\nИллюстрация"
-                    for p in shape.text_frame.paragraphs:
-                        p.alignment = PP_ALIGN.CENTER
-                        p.font.size = Pt(13)
+                    _add_placeholder(sl, img_left, img_top, IW)
 
         except Exception as e:
             log.error(f"Слайд {i}: {e}")
@@ -386,6 +394,18 @@ async def make_pptx(data):
     prs.save(buf)
     buf.seek(0)
     return buf
+
+def _add_placeholder(slide, left, top, width):
+    shape = slide.shapes.add_shape(1, left, top, width, Emu(3600000))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
+    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
+    shape.line.width = Pt(1)
+    shape.text_frame.text = "🖼️\nФото не найдено"
+    for p in shape.text_frame.paragraphs:
+        p.alignment = PP_ALIGN.CENTER
+        p.font.size = Pt(13)
+        p.font.color.rgb = type(p.font.color).rgb = (140, 140, 160)
 
 # ===== ИМЯ ФАЙЛА =====
 def filename(topic):
@@ -414,7 +434,7 @@ async def start(msg: Message, state: FSMContext):
     admin = "🆓 Бесплатный доступ!\n" if msg.from_user.id == ADMIN_ID else ""
     await msg.answer(
         f"🎓 *Привет! Я создаю презентации с ИИ!*\n\n"
-        f"✨ Умный текст\n🎨 Уникальные картинки\n📊 PowerPoint\n\n"
+        f"✨ Умный текст\n🖼️ Реальные фото Pixabay\n📊 PowerPoint\n\n"
         f"💰 Цена: {PRICE}₽\n{admin}\n👇 Кнопка:",
         parse_mode="Markdown", reply_markup=menu()
     )
@@ -422,26 +442,22 @@ async def start(msg: Message, state: FSMContext):
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(msg: Message):
     await msg.answer(
-        "📌 *Как создать:*\n\n1. Нажми «Создать»\n2. Напиши тему и число (4-12)\n"
-        "3. Оплати 100₽\n4. Получи файл\n\nПример: `Нейросети 8`",
+        "📌 *Как создать:*\n\n1. Нажми «Создать»\n2. Тема и число (4-12)\n"
+        "3. Оплати 100₽\n4. Получи файл!\n\n*Примеры:*\n`Нейросети 8`\n`Биология 6`",
         parse_mode="Markdown"
     )
 
 @dp.message(F.text == "💰 Цена")
 async def price_cmd(msg: Message):
-    await msg.answer(
-        f"💎 *{PRICE}₽*\n\n✅ Текст GigaChat\n✅ AI-картинки\n✅ 5-12 слайдов\n✅ Литература\n💳 Оплата: карты, СБП",
-        parse_mode="Markdown"
-    )
+    await msg.answer(f"💎 *{PRICE}₽*\n\n✅ Текст GigaChat\n✅ Фото Pixabay\n✅ 5-12 слайдов\n✅ Литература",
+                     parse_mode="Markdown")
 
 @dp.message(F.text == "🎨 Создать презентацию")
 async def start_create(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(State.topic)
-    await msg.answer(
-        "✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История 6`\n`Квантовая физика 5`",
-        parse_mode="Markdown"
-    )
+    await msg.answer("✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История 6`\n`Биология 5`",
+                     parse_mode="Markdown")
 
 @dp.message(StateFilter(State.topic))
 async def got_topic(msg: Message, state: FSMContext):
@@ -452,13 +468,13 @@ async def got_topic(msg: Message, state: FSMContext):
     
     parts = text.split()
     if len(parts) < 2:
-        return await msg.answer("❌ Нужно: Тема Число\nПример: `Нейросети 6`")
+        return await msg.answer("❌ Формат: Тема Число\nПример: `Нейросети 6`")
     
     try:
         n = int(parts[-1])
         topic = " ".join(parts[:-1])
     except ValueError:
-        return await msg.answer("❌ Последнее слово — число!\nПример: `История 6`")
+        return await msg.answer("❌ Число в конце!\nПример: `История 6`")
     
     if n < 4 or n > 12:
         return await msg.answer("❌ От 4 до 12 слайдов")
@@ -471,13 +487,13 @@ async def got_topic(msg: Message, state: FSMContext):
         try:
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
             if not data:
-                return await status.edit_text("❌ GigaChat не ответил. Попробуй другую тему.")
-            await status.edit_text("🎨 Создаю слайды...")
-            pptx = await asyncio.wait_for(make_pptx(data), timeout=120)
+                return await status.edit_text("❌ GigaChat не ответил")
+            await status.edit_text("🖼️ Подбираю фото с Pixabay...")
+            pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
             if not pptx:
                 return await status.edit_text("❌ Ошибка сборки")
             await send_file(msg, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n🖼️ Фото с Pixabay")
             await status.delete()
         except asyncio.TimeoutError:
             await status.edit_text("⏰ Долго. Упрости тему.")
@@ -536,17 +552,17 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
         topic = d.get("topic") or (p.metadata or {}).get("topic")
         n = d.get("num") or (p.metadata or {}).get("n")
         
-        await cb.message.edit_text(f"✅ Оплачено! Создаю «{topic}»...")
+        await cb.message.edit_text(f"✅ Оплачено! Генерирую «{topic}»...")
         try:
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
             if not data:
                 return await cb.message.edit_text("❌ Ошибка. Деньги вернутся.")
-            await cb.message.edit_text("🎨 Собираю...")
-            pptx = await asyncio.wait_for(make_pptx(data), timeout=120)
+            await cb.message.edit_text("🖼️ Подбираю фото...")
+            pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
             if not pptx:
                 return await cb.message.edit_text("❌ Ошибка сборки.")
             await send_file(cb.message, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено\n🖼️ Фото с Pixabay")
             await cb.message.delete()
         except asyncio.TimeoutError:
             await cb.message.edit_text("⏰ Долго. Поддержка: @ultimatepreza")
@@ -572,6 +588,10 @@ async def fallback(msg: Message):
 # ===== ЗАПУСК =====
 async def main():
     log.info("🚀 Запуск...")
+    if PIXABAY_KEY:
+        log.info("✅ Pixabay API подключён")
+    else:
+        log.warning("⚠️ Pixabay API не подключён")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
