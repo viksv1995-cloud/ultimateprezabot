@@ -67,7 +67,7 @@ class State(StatesGroup):
     topic = State()
     payment = State()
 
-# ===== ТОКЕН GIGACHAT =====
+# ===== ТОКЕН GIGACHAT (С ПОВТОРНЫМИ ПОПЫТКАМИ) =====
 _token = None
 _token_exp = 0
 _token_lock = asyncio.Lock()
@@ -77,19 +77,41 @@ async def get_token():
     async with _token_lock:
         if _token and time.time() < _token_exp - 300:
             return _token
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-                    headers={"Authorization": f"Basic {GIGA_AUTH}", "RqUID": str(uuid.uuid4())},
-                    data={"scope": "GIGACHAT_API_PERS"}, ssl=False, timeout=30
-                ) as r:
-                    if r.status == 200:
-                        _token = (await r.json())["access_token"]
-                        _token_exp = time.time() + 3600
-                        return _token
-        except Exception as e:
-            log.error(f"Токен: {e}")
+        
+        # 5 попыток получить токен
+        for attempt in range(5):
+            try:
+                log.info(f"Запрос токена GigaChat (попытка {attempt+1}/5)...")
+                connector = aiohttp.TCPConnector(ssl=False)  # Отключаем SSL проверку
+                async with aiohttp.ClientSession(connector=connector) as s:
+                    async with s.post(
+                        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+                        headers={
+                            "Authorization": f"Basic {GIGA_AUTH}",
+                            "RqUID": str(uuid.uuid4()),
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json"
+                        },
+                        data={"scope": "GIGACHAT_API_PERS"},
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            _token = data["access_token"]
+                            _token_exp = time.time() + 3600
+                            log.info("✅ Токен получен")
+                            return _token
+                        else:
+                            text = await r.text()
+                            log.warning(f"Токен: статус {r.status}, ответ: {text[:200]}")
+                
+                await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
+                
+            except Exception as e:
+                log.warning(f"Токен попытка {attempt+1}: {e}")
+                await asyncio.sleep(2 ** attempt)
+        
+        log.error("❌ Все попытки получить токен не удались")
         return None
 
 # ===== БОТ =====
@@ -140,64 +162,77 @@ def extract_json(text):
     except:
         return None
 
-# ===== GIGACHAT =====
+# ===== GIGACHAT (С ПОВТОРНЫМИ ПОПЫТКАМИ) =====
 async def ask_ai(text, temp=0.75):
     token = await get_token()
     if not token:
+        log.error("Нет токена — GigaChat недоступен")
         return None
-    for attempt in range(3):
+    
+    for attempt in range(5):  # 5 попыток вместо 3
         try:
-            async with aiohttp.ClientSession() as s:
+            log.info(f"GigaChat запрос (попытка {attempt+1}/5)...")
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as s:
                 async with s.post(
                     "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json"
+                    },
                     json={
                         "model": "GigaChat",
                         "messages": [
-                            {"role": "system", "content": "You are a research librarian. You respond ONLY with valid JSON. No comments, no markdown."},
+                            {"role": "system", "content": "You are a professor. Respond ONLY with valid JSON."},
                             {"role": "user", "content": text}
                         ],
-                        "temperature": temp, "max_tokens": 3500
-                    }, ssl=False, timeout=90
+                        "temperature": temp,
+                        "max_tokens": 3500
+                    },
+                    timeout=aiohttp.ClientTimeout(total=90)
                 ) as r:
                     if r.status == 200:
-                        return (await r.json())["choices"][0]["message"]["content"]
-                    if r.status == 429:
+                        data = await r.json()
+                        content = data["choices"][0]["message"]["content"]
+                        log.info(f"✅ GigaChat ответил ({len(content)} символов)")
+                        return content
+                    elif r.status == 429:
+                        wait = 2 ** attempt
+                        log.warning(f"Rate limit, ждём {wait}с...")
+                        await asyncio.sleep(wait)
+                    else:
+                        text_err = await r.text()
+                        log.warning(f"GigaChat статус {r.status}: {text_err[:200]}")
                         await asyncio.sleep(2 ** attempt)
-        except:
-            await asyncio.sleep(1)
+                        
+        except asyncio.TimeoutError:
+            log.warning(f"Таймаут GigaChat (попытка {attempt+1})")
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            log.warning(f"GigaChat ошибка (попытка {attempt+1}): {e}")
+            await asyncio.sleep(2 ** attempt)
+    
+    log.error("❌ Все попытки GigaChat исчерпаны")
     return None
 
-# ===== НОВЫЙ МОЩНЫЙ ПРОМПТ =====
 async def get_content(topic, n):
     prompt = f"""Create an educational presentation about "{topic}". Exactly {n} slides.
 
-For each content slide, you MUST provide a "search_query" — a short English phrase (3-6 words) 
+For each content slide, provide "search_query" — a short English phrase (3-6 words) 
 to find a historically ACCURATE photo on Unsplash/Pixabay.
 
 CRITICAL RULES for search_query:
-1. Be EXTREMELY SPECIFIC. Include: subject + type of image + era/context.
-2. Types of images to use: "historical portrait", "19th century painting", "medieval manuscript", 
-   "architectural photo", "ancient artifact", "scientific diagram", "vintage photograph".
+1. Be EXTREMELY SPECIFIC: subject + type of image + era/context.
+2. Types: "historical portrait", "16th century painting", "medieval manuscript", 
+   "architectural photo", "ancient artifact", "scientific diagram".
 3. NEVER use abstract concepts. Always ask for something VISUAL and PHOTOGRAPHABLE.
 4. Match the EXACT historical period and subject.
 
-EXAMPLES OF GOOD search_query:
-- "Ivan the Terrible 16th century portrait" (NOT "Russian tsar painting")
+EXAMPLES:
+- "Ivan the Terrible 16th century portrait" (NOT "Russian tsar")
 - "Oprichniki historical painting Russian" (NOT "опричнина terror")
 - "Kremlin Moscow 16th century architecture" (NOT "Russia building")
-- "medieval Russian warrior armor museum" (NOT "warrior battle")
-- "ancient Slavic manuscript parchment" (NOT "old book")
-
-EXAMPLES OF BAD search_query:
-- "Ivan Grozny" (too vague)
-- "culture development" (abstract, not photographable)
-- "Russian history" (too broad)
-
-Slide format:
-- Slide 1: Title
-- Slides 2-{n-1}: Content with "title", "text" (3-4 sentences with facts), "search_query"
-- Slide {n}: References (5 real books/articles)
 
 Return ONLY JSON:
 {{
@@ -209,26 +244,17 @@ Return ONLY JSON:
   ]
 }}"""
     
-    resp = await ask_ai(prompt, temp=0.6)  # Ниже температура = точнее ответ
+    resp = await ask_ai(prompt, temp=0.6)
     if not resp:
         return None
     
     data = extract_json(resp)
     if not data:
-        # Вторая попытка
         resp2 = await ask_ai(prompt, temp=0.4)
         if resp2:
             data = extract_json(resp2)
     
-    if data and "slides" in data:
-        # Логируем все search_query для отладки
-        for i, s in enumerate(data["slides"]):
-            if s.get("type") == "content":
-                sq = s.get("search_query", "НЕТ")
-                log.info(f"Слайд {i}: '{s.get('title','')}' → search_query: '{sq}'")
-        return data
-    
-    return None
+    return data if data and "slides" in data else None
 
 # ===== ПОИСК КАРТИНОК =====
 
@@ -289,7 +315,7 @@ async def search_pixabay(query: str) -> Optional[BytesIO]:
                             url = random.choice(hits)["largeImageURL"]
                             img = await _download(url)
                             if img:
-                                log.info(f"✅ Pixabay ({img_type}): {query[:60]}")
+                                log.info(f"✅ Pixabay: {query[:60]}")
                                 return img
     except:
         pass
@@ -299,15 +325,12 @@ async def get_image(query: str) -> Optional[BytesIO]:
     if not query:
         return None
     
-    # 1. Unsplash
     img = await search_unsplash(query)
     if img: return img
     
-    # 2. Pixabay
     img = await search_pixabay(query)
     if img: return img
     
-    # 3. Pollinations AI (запасной)
     safe = re.sub(r'[^a-zA-Z0-9\s]', '', query).strip()
     if safe:
         try:
@@ -325,7 +348,6 @@ async def get_image(query: str) -> Optional[BytesIO]:
         except:
             pass
     
-    log.warning(f"❌ Все сервисы не дали результат для: {query[:80]}")
     return None
 
 # ===== PPTX =====
@@ -433,39 +455,23 @@ async def start(msg: Message, state: FSMContext):
     await state.clear()
     admin = "🆓 Бесплатный доступ!\n" if msg.from_user.id == ADMIN_ID else ""
     await msg.answer(
-        f"🎓 *PrezaBot — презентации с ИИ!*\n\n"
-        f"✨ Текст: GigaChat\n🖼️ Фото: Unsplash + Pixabay\n📊 PowerPoint\n\n"
-        f"💰 Цена: {PRICE}₽\n{admin}👇 Кнопка:",
+        f"🎓 *PrezaBot*\n\n✨ Текст: GigaChat\n🖼️ Фото: Unsplash + Pixabay\n📊 PowerPoint\n\n💰 {PRICE}₽\n{admin}👇",
         parse_mode="Markdown", reply_markup=menu()
     )
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(msg: Message):
-    await msg.answer(
-        "📌 *Как создать:*\n\n"
-        "1. Нажми «Создать»\n2. Тема + число (4-12)\n"
-        "3. Оплати 100₽\n4. Получи файл!\n\n"
-        "Примеры: `Нейросети 8`, `История России 16 век 7`",
-        parse_mode="Markdown"
-    )
+    await msg.answer("📌 *Как:*\n1. «Создать»\n2. Тема Число (4-12)\n3. Оплатить\n4. Файл!\n\nПример: `Нейросети 8`", parse_mode="Markdown")
 
 @dp.message(F.text == "💰 Цена")
 async def price_cmd(msg: Message):
-    await msg.answer(
-        f"💎 *{PRICE}₽*\n✅ Текст GigaChat\n✅ Фото Unsplash/Pixabay\n"
-        f"✅ Слайды 5-12\n✅ Литература",
-        parse_mode="Markdown"
-    )
+    await msg.answer(f"💎 *{PRICE}₽*\n✅ Текст GigaChat\n✅ Фото\n✅ Слайды 5-12\n✅ Литература", parse_mode="Markdown")
 
 @dp.message(F.text == "🎨 Создать презентацию")
 async def start_create(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(State.topic)
-    await msg.answer(
-        "✏️ *Тема и количество:*\n\n"
-        "`Нейросети 8`\n`История России 16 век 7`\n`Биология 6`\n`Квантовая физика 5`",
-        parse_mode="Markdown"
-    )
+    await msg.answer("✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История России 16 век 7`", parse_mode="Markdown")
 
 @dp.message(StateFilter(State.topic))
 async def got_topic(msg: Message, state: FSMContext):
@@ -490,10 +496,10 @@ async def got_topic(msg: Message, state: FSMContext):
         await state.clear()
         status = await msg.answer(f"🔄 Генерирую «{topic}», {n} слайдов...")
         try:
-            data = await asyncio.wait_for(get_content(topic, n), timeout=150)
+            data = await asyncio.wait_for(get_content(topic, n), timeout=180)
             if not data:
-                return await status.edit_text("❌ GigaChat не ответил")
-            await status.edit_text("🖼️ Подбираю фото (Unsplash → Pixabay → AI)...")
+                return await status.edit_text("❌ GigaChat не отвечает. Попробуйте позже.")
+            await status.edit_text("🖼️ Подбираю фото...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
             if not pptx:
                 return await status.edit_text("❌ Ошибка сборки")
@@ -501,10 +507,10 @@ async def got_topic(msg: Message, state: FSMContext):
                           f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов")
             await status.delete()
         except asyncio.TimeoutError:
-            await status.edit_text("⏰ Долго.")
+            await status.edit_text("⏰ Слишком долго. Попробуйте позже.")
         except Exception as e:
             log.error(f"{e}")
-            await status.edit_text("❌ Ошибка")
+            await status.edit_text("❌ Ошибка. /start")
     else:
         try:
             payment = Payment.create({
@@ -545,8 +551,8 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
         n = d.get("num") or (p.metadata or {}).get("n")
         await cb.message.edit_text(f"✅ «{topic}»...")
         try:
-            data = await asyncio.wait_for(get_content(topic, n), timeout=150)
-            if not data: return await cb.message.edit_text("❌ Ошибка генерации")
+            data = await asyncio.wait_for(get_content(topic, n), timeout=180)
+            if not data: return await cb.message.edit_text("❌ GigaChat не ответил")
             await cb.message.edit_text("🖼️ Фото...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
             if not pptx: return await cb.message.edit_text("❌ Ошибка сборки")
