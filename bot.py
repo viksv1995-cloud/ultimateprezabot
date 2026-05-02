@@ -19,6 +19,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.enum.text import PP_ALIGN
+from pptx.oxml.ns import qn
 from yookassa import Configuration, Payment
 
 # ===== ЛОГИ =====
@@ -53,13 +54,25 @@ if not all([BOT_TOKEN, GIGA_AUTH, YOOKASSA_ID, YOOKASSA_KEY]):
 Configuration.account_id = YOOKASSA_ID
 Configuration.secret_key = YOOKASSA_KEY
 
-# ===== РАЗМЕРЫ СЛАЙДА =====
+# ===== КОНСТАНТЫ СЛАЙДА =====
 SW = Emu(12192000)
 SH = Emu(6858000)
 MG = Emu(365760)
 GP = Emu(274320)
 IW = Emu(4937760)
 TW = SW - IW - GP - MG*2
+
+# ===== ЦВЕТОВЫЕ ТЕМЫ ДЛЯ ФОНА =====
+THEMES = [
+    {"bg": "F5F0E8", "accent": "3D5A80", "name": "Теплый пергамент"},
+    {"bg": "E8F4F8", "accent": "2C3E50", "name": "Небесный"},
+    {"bg": "F0F4E8", "accent": "4A6741", "name": "Зеленый чай"},
+    {"bg": "F8F0F5", "accent": "6B3A5B", "name": "Розовый туман"},
+    {"bg": "F0F0F5", "accent": "2B3A67", "name": "Сумеречный"},
+    {"bg": "FFF8F0", "accent": "C0392B", "name": "Теплый рассвет"},
+    {"bg": "F5F5F0", "accent": "1A5276", "name": "Морской бриз"},
+    {"bg": "FDFEFE", "accent": "34495E", "name": "Облачный"},
+]
 
 # ===== СОСТОЯНИЯ =====
 class State(StatesGroup):
@@ -122,7 +135,7 @@ def extract_json(text):
     in_string = False
     cleaned = []
     for c in json_str:
-        if c == '"':
+        if c == '"' and (not cleaned or cleaned[-1] != '\\'):
             in_string = not in_string
             cleaned.append(c)
         elif c == '\n' and in_string:
@@ -134,15 +147,14 @@ def extract_json(text):
         else:
             cleaned.append(c)
     json_str = ''.join(cleaned)
-    
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
-    json_str = re.sub(r',\s*,', ',', json_str)
     
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
         log.error(f"JSON error: {e}")
+        log.error(f"Near: ...{json_str[max(0,e.pos-30):e.pos+30]}...")
         return None
 
 # ===== GIGACHAT =====
@@ -150,7 +162,6 @@ async def ask_ai(text, temp=0.75):
     token = await get_token()
     if not token:
         return None
-
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession() as s:
@@ -160,7 +171,7 @@ async def ask_ai(text, temp=0.75):
                     json={
                         "model": "GigaChat",
                         "messages": [
-                            {"role": "system", "content": "Ты — профессор. Объясняешь сложное на пальцах. Отвечай ТОЛЬКО валидным JSON."},
+                            {"role": "system", "content": "Ты — профессор-методист. Отвечаешь ТОЛЬКО валидным JSON. Строго соблюдаешь формат."},
                             {"role": "user", "content": text}
                         ],
                         "temperature": temp, "max_tokens": 3500
@@ -170,61 +181,87 @@ async def ask_ai(text, temp=0.75):
                         return (await r.json())["choices"][0]["message"]["content"]
                     if r.status == 429:
                         await asyncio.sleep(2 ** attempt)
-        except Exception as e:
-            log.warning(f"GigaChat {attempt+1}: {e}")
-            await asyncio.sleep(1)
+        except: await asyncio.sleep(1)
     return None
 
+# ===== УЛУЧШЕННЫЙ ПРОМПТ ДЛЯ КОНТЕНТА =====
 async def get_content(topic, n):
-    prompt = f"""Создай учебную презентацию на тему "{topic}". Ровно {n} слайдов.
+    prompt = f"""Ты — эксперт по теме "{topic}". Создай учебную презентацию из РОВНО {n} слайдов.
 
 СТРУКТУРА:
-Слайд 1: Титульный (тема, "Москва, 2026")
-Слайды 2-{n-1}: Содержательные:
-  - "title": Яркий заголовок (5-9 слов)
-  - "text": 3-4 предложения с ПРИМЕРАМИ
-  - "search_query": 1-3 ключевых слова на русском для поиска фото по теме слайда.
-    Примеры: "ДНК молекула", "клетка микроскоп", "нейроны мозга", "планеты солнечной системы"
+Слайд 1: Титульный ("{topic}", "Москва, 2026")
+Слайды 2-{n-1}: Содержательные. Для каждого напиши:
+  - "title": точный исторический/научный заголовок (5-9 слов), строго по теме
+  - "text": 3-4 предложения с КОНКРЕТНЫМИ фактами, датами, именами, цифрами
+  - "search_query": ВАЖНО! Это запрос для поиска фото. Пиши 2-4 КОНКРЕТНЫХ слова на АНГЛИЙСКОМ. 
+    Правила для search_query:
+    * ОПИСЫВАЙ ТО, ЧТО МОЖНО СФОТОГРАФИРОВАТЬ: людей, здания, предметы, природу
+    * ПРИМЕРЫ ПРАВИЛЬНЫХ запросов:
+      - "Ivan the Terrible portrait" (а не "Ivan Grozny")
+      - "Kremlin Moscow 16th century" (а не "Russia history")
+      - "ancient printing press book" (а не "culture education")
+      - "Trinity Lavra monastery Russia" (а не "Троице-Сергиева лавра")
+      - "medieval battle armor warriors" (а не "борьба с врагами")
+      - "Stroganov merchant salt trade" (а не "купцы Строгановы")
+    * НЕ ИСПОЛЬЗУЙ абстрактные понятия, которые нельзя сфоткать
+    * Всегда добавляй уточняющие слова: portrait, building, painting, monument, manuscript, map
 
-Слайд {n}: Список литературы (5 реальных книг/статей)
+Слайд {n}: Список литературы (реальные книги/статьи по теме, 5 шт.)
 
-ОТВЕТ — ТОЛЬКО JSON:
+ФОРМАТ ОТВЕТА — СТРОГО JSON:
 {{
   "title": "Заголовок презентации",
   "slides": [
     {{"type": "title", "text": "Москва, 2026"}},
-    {{"type": "content", "title": "...", "text": "...", "search_query": "ключевые слова на русском"}},
-    {{"type": "references", "text": "1. ...\\\\n2. ..."}}
+    {{"type": "content", "title": "Заголовок слайда", "text": "Текст с фактами...", "search_query": "english specific searchable words"}},
+    ...
+    {{"type": "references", "text": "1. ...\\\\n2. ...\\\\n3. ...\\\\n4. ...\\\\n5. ..."}}
   ]
 }}
+
+ВАЖНО:
+- Ровно {n} слайдов в массиве slides
+- Каждый search_query УНИКАЛЕН и соответствует тексту слайда
+- Слова в search_query только на английском
+- ОПИСЫВАЙ КОНКРЕТНЫЕ ВИЗУАЛЬНЫЕ ОБЪЕКТЫ
 """
+    
     resp = await ask_ai(prompt, temp=0.7)
     if not resp:
+        log.error("GigaChat не ответил")
         return None
-
+    
     data = extract_json(resp)
     if not data:
+        log.warning("Первая попытка не удалась, пробую с другой температурой...")
         resp2 = await ask_ai(prompt, temp=0.5)
         if resp2:
             data = extract_json(resp2)
     
     if not data or "slides" not in data:
+        log.error("Нет slides в ответе")
         return None
     
-    log.info(f"Получено {len(data['slides'])} слайдов")
+    # Проверка search_query
+    for i, s in enumerate(data.get("slides", [])):
+        if s.get("type") == "content":
+            sq = s.get("search_query", "")
+            log.info(f"Слайд {i}: search_query='{sq}'")
+    
+    log.info(f"OK: {len(data['slides'])} слайдов")
     return data
 
-# ===== PIXABAY API =====
+# ===== PIXABAY =====
 async def pixabay_search(query: str, count: int = 5) -> List[str]:
-    """Ищет фото на Pixabay, возвращает список URL (largeImageURL)."""
     if not PIXABAY_KEY:
         log.warning("Нет Pixabay API ключа!")
         return []
     
+    # Если запрос на русском — пробуем и так, но лучше английский
     params = {
         "key": PIXABAY_KEY,
         "q": query,
-        "per_page": min(count, 20),  # Максимум 20 за запрос
+        "per_page": min(count, 20),
         "orientation": "horizontal",
         "min_width": 1024,
         "min_height": 768,
@@ -235,27 +272,31 @@ async def pixabay_search(query: str, count: int = 5) -> List[str]:
     
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(
-                "https://pixabay.com/api/",
-                params=params, timeout=15
-            ) as r:
+            async with s.get("https://pixabay.com/api/", params=params, timeout=15) as r:
                 if r.status == 200:
                     data = await r.json()
                     hits = data.get("hits", [])
                     urls = [h["largeImageURL"] for h in hits if "largeImageURL" in h]
                     log.info(f"Pixabay: {len(urls)} фото по '{query}'")
+                    if urls:
+                        return urls
+                    
+        # Если фото нет — пробуем с векторами/иллюстрациями
+        params["image_type"] = "illustration"
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://pixabay.com/api/", params=params, timeout=15) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    hits = data.get("hits", [])
+                    urls = [h["largeImageURL"] for h in hits if "largeImageURL" in h]
+                    log.info(f"Pixabay (illustration): {len(urls)} по '{query}'")
                     return urls
-                elif r.status == 429:
-                    log.warning("Pixabay rate limit")
-                else:
-                    log.error(f"Pixabay: {r.status}")
     except Exception as e:
-        log.error(f"Pixabay ошибка: {e}")
+        log.warning(f"Pixabay: {e}")
     
     return []
 
 async def download_image(url: str) -> Optional[BytesIO]:
-    """Скачивает фото по URL."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=20) as r:
@@ -263,14 +304,12 @@ async def download_image(url: str) -> Optional[BytesIO]:
                     data = await r.read()
                     if len(data) > 1000:
                         return BytesIO(data)
-    except Exception as e:
-        log.warning(f"Скачивание: {e}")
+    except: pass
     return None
 
 async def get_image(query: str) -> Optional[BytesIO]:
-    """Получает фото: Pixabay → Pollinations AI (запасной)."""
-    # 1. Пробуем Pixabay
-    if PIXABAY_KEY:
+    # 1. Pixabay
+    if PIXABAY_KEY and query:
         urls = await pixabay_search(query)
         if urls:
             url = random.choice(urls)
@@ -278,29 +317,52 @@ async def get_image(query: str) -> Optional[BytesIO]:
             if img:
                 return img
     
-    # 2. Запасной — Pollinations AI
-    safe = re.sub(r'[^a-zA-Zа-яА-Я0-9\s]', '', query).strip()
-    if not safe:
-        safe = "abstract presentation"
-    encoded = safe.replace(' ', '%20')
-    
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"https://image.pollinations.ai/prompt/{encoded}",
-                params={"width": 1024, "height": 768, "nologo": "true", "seed": str(uuid.uuid4().int)[:8]},
-                timeout=25
-            ) as r:
-                if r.status == 200:
-                    data = await r.read()
-                    if len(data) > 1000:
-                        return BytesIO(data)
-    except:
-        pass
+    # 2. Запасной — упрощённый запрос
+    if query:
+        simple = re.sub(r'[^a-zA-Z\s]', '', query).strip()
+        words = simple.split()
+        if len(words) > 3:
+            simple = ' '.join(words[:3])
+        
+        if simple:
+            safe = simple.replace(' ', '%20')
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        f"https://image.pollinations.ai/prompt/{safe}",
+                        params={"width": 1024, "height": 768, "nologo": "true", "seed": str(uuid.uuid4().int)[:8]},
+                        timeout=25
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.read()
+                            if len(data) > 1000:
+                                return BytesIO(data)
+            except: pass
     
     return None
 
-# ===== PPTX =====
+# ===== PPTX С ДИЗАЙНОМ =====
+def apply_theme(slide, theme: dict, is_title=False):
+    """Применяет цветовую тему к фону слайда."""
+    bg_color = theme["bg"]
+    accent = theme["accent"]
+    
+    # Цвет фона
+    background = slide.background
+    fill = background.fill
+    fill.solid()
+    fill.fore_color.rgb = type(fill.fore_color).rgb = _hex_to_rgb(bg_color)
+    
+    # Цвет заголовка
+    if slide.shapes.title:
+        title = slide.shapes.title
+        title.text_frame.paragraphs[0].font.color.rgb = type(title.text_frame.paragraphs[0].font.color).rgb = _hex_to_rgb(accent)
+
+def _hex_to_rgb(hex_color: str):
+    """Переводит HEX в tuple для python-pptx."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
 async def make_pptx(data):
     slides = data.get("slides", [])
     if not slides:
@@ -309,7 +371,11 @@ async def make_pptx(data):
     prs = Presentation()
     prs.slide_width = SW
     prs.slide_height = SH
-
+    
+    # Выбираем случайную тему для всей презентации
+    theme = random.choice(THEMES)
+    log.info(f"Тема: {theme['name']} (bg: #{theme['bg']}, accent: #{theme['accent']})")
+    
     tasks = []
     for s in slides:
         if s.get("type") == "content":
@@ -326,13 +392,19 @@ async def make_pptx(data):
         try:
             if stype == "title":
                 sl = prs.slides.add_slide(prs.slide_layouts[0])
+                apply_theme(sl, theme, is_title=True)
                 sl.shapes.title.text = data.get("title", "Презентация")
+                sl.shapes.title.text_frame.paragraphs[0].font.size = Pt(36)
+                sl.shapes.title.text_frame.paragraphs[0].font.bold = True
+                
                 if len(sl.placeholders) > 1:
                     sl.placeholders[1].text = s.get("text", f"Москва, {datetime.now().year}")
                     sl.placeholders[1].text_frame.paragraphs[0].font.size = Pt(20)
+                    sl.placeholders[1].text_frame.paragraphs[0].font.color.rgb = type(sl.placeholders[1].text_frame.paragraphs[0].font.color).rgb = _hex_to_rgb(theme["accent"])
 
             elif stype == "references":
                 sl = prs.slides.add_slide(prs.slide_layouts[1])
+                apply_theme(sl, theme)
                 sl.shapes.title.text = "📚 Список литературы"
                 if len(sl.placeholders) > 1:
                     sl.placeholders[1].text = s.get("text", "")
@@ -341,6 +413,7 @@ async def make_pptx(data):
 
             else:
                 sl = prs.slides.add_slide(prs.slide_layouts[1])
+                apply_theme(sl, theme)
                 sl.shapes.title.text = s.get("title", "Информация")
                 sl.shapes.title.text_frame.paragraphs[0].font.size = Pt(28)
                 sl.shapes.title.text_frame.paragraphs[0].font.bold = True
@@ -372,7 +445,7 @@ async def make_pptx(data):
                 if isinstance(img, BytesIO):
                     try:
                         sl.shapes.add_picture(img, img_left, img_top, width=IW)
-                        caption = s.get("search_query", s.get("image_prompt", "Иллюстрация"))
+                        caption = s.get("search_query", "Иллюстрация")
                         cap_top = img_top + Emu(3700000)
                         cap = sl.shapes.add_textbox(img_left, cap_top, IW, Emu(400000))
                         cap.text_frame.text = caption
@@ -380,11 +453,12 @@ async def make_pptx(data):
                             p.font.size = Pt(9)
                             p.font.italic = True
                             p.alignment = PP_ALIGN.CENTER
+                            p.font.color.rgb = type(p.font.color).rgb = _hex_to_rgb(theme["accent"])
                     except Exception as e:
-                        log.error(f"Вставка картинки {i}: {e}")
-                        _add_placeholder(sl, img_left, img_top, IW)
+                        log.error(f"Вставка {i}: {e}")
+                        _add_placeholder(sl, img_left, img_top, IW, theme)
                 else:
-                    _add_placeholder(sl, img_left, img_top, IW)
+                    _add_placeholder(sl, img_left, img_top, IW, theme)
 
         except Exception as e:
             log.error(f"Слайд {i}: {e}")
@@ -395,19 +469,20 @@ async def make_pptx(data):
     buf.seek(0)
     return buf
 
-def _add_placeholder(slide, left, top, width):
+def _add_placeholder(slide, left, top, width, theme: dict):
     shape = slide.shapes.add_shape(1, left, top, width, Emu(3600000))
     shape.fill.solid()
-    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
-    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
+    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (250, 250, 255)
+    shape.line.color.rgb = type(shape.line.color).rgb = _hex_to_rgb(theme["accent"])
     shape.line.width = Pt(1)
     shape.text_frame.text = "🖼️\nФото не найдено"
     for p in shape.text_frame.paragraphs:
         p.alignment = PP_ALIGN.CENTER
         p.font.size = Pt(13)
-        p.font.color.rgb = type(p.font.color).rgb = (140, 140, 160)
+        p.font.color.rgb = type(p.font.color).rgb = _hex_to_rgb(theme["accent"])
 
-# ===== ИМЯ ФАЙЛА =====
+# ===== ОСТАЛЬНОЕ (без изменений) =====
+
 def filename(topic):
     name = re.sub(r'[^\w\s-]', '', topic).strip()
     if len(name) > 30:
@@ -415,7 +490,6 @@ def filename(topic):
     name = name.replace(' ', '_') or "presentation"
     return f"{name}.pptx"
 
-# ===== ОТПРАВКА =====
 async def send_file(msg, data, name, caption):
     for t in range(3):
         try:
@@ -426,7 +500,7 @@ async def send_file(msg, data, name, caption):
             await asyncio.sleep(e.retry_after)
         except: await asyncio.sleep(2)
 
-# ========== ОБРАБОТЧИКИ ==========
+# ===== ОБРАБОТЧИКИ =====
 
 @dp.message(Command("start"))
 async def start(msg: Message, state: FSMContext):
@@ -434,7 +508,7 @@ async def start(msg: Message, state: FSMContext):
     admin = "🆓 Бесплатный доступ!\n" if msg.from_user.id == ADMIN_ID else ""
     await msg.answer(
         f"🎓 *Привет! Я создаю презентации с ИИ!*\n\n"
-        f"✨ Умный текст\n🖼️ Реальные фото Pixabay\n📊 PowerPoint\n\n"
+        f"✨ Умный текст\n🖼️ Фото Pixabay\n🎨 Красивый дизайн\n\n"
         f"💰 Цена: {PRICE}₽\n{admin}\n👇 Кнопка:",
         parse_mode="Markdown", reply_markup=menu()
     )
@@ -443,20 +517,20 @@ async def start(msg: Message, state: FSMContext):
 async def help_cmd(msg: Message):
     await msg.answer(
         "📌 *Как создать:*\n\n1. Нажми «Создать»\n2. Тема и число (4-12)\n"
-        "3. Оплати 100₽\n4. Получи файл!\n\n*Примеры:*\n`Нейросети 8`\n`Биология 6`",
+        "3. Оплати 100₽\n4. Получи файл!\n\n*Примеры:*\n`Нейросети 8`\n`История России 16 век 7`\n`Биология 6`",
         parse_mode="Markdown"
     )
 
 @dp.message(F.text == "💰 Цена")
 async def price_cmd(msg: Message):
-    await msg.answer(f"💎 *{PRICE}₽*\n\n✅ Текст GigaChat\n✅ Фото Pixabay\n✅ 5-12 слайдов\n✅ Литература",
+    await msg.answer(f"💎 *{PRICE}₽*\n\n✅ Текст GigaChat\n✅ Фото Pixabay\n✅ Цветной дизайн\n✅ Литература",
                      parse_mode="Markdown")
 
 @dp.message(F.text == "🎨 Создать презентацию")
 async def start_create(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(State.topic)
-    await msg.answer("✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История 6`\n`Биология 5`",
+    await msg.answer("✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История России 16 век 7`\n`Квантовая физика 5`",
                      parse_mode="Markdown")
 
 @dp.message(StateFilter(State.topic))
@@ -493,7 +567,7 @@ async def got_topic(msg: Message, state: FSMContext):
             if not pptx:
                 return await status.edit_text("❌ Ошибка сборки")
             await send_file(msg, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n🖼️ Фото с Pixabay")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n🎨 Цветной дизайн\n🖼️ Фото Pixabay")
             await status.delete()
         except asyncio.TimeoutError:
             await status.edit_text("⏰ Долго. Упрости тему.")
@@ -541,17 +615,14 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
     if not pid:
         await cb.answer("❌ Платёж не найден")
         return
-    
     try:
         p = Payment.find_one(pid)
     except:
         await cb.answer("❌ Ошибка проверки")
         return
-    
     if p.status == "succeeded":
         topic = d.get("topic") or (p.metadata or {}).get("topic")
         n = d.get("num") or (p.metadata or {}).get("n")
-        
         await cb.message.edit_text(f"✅ Оплачено! Генерирую «{topic}»...")
         try:
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
@@ -562,7 +633,7 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
             if not pptx:
                 return await cb.message.edit_text("❌ Ошибка сборки.")
             await send_file(cb.message, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено\n🖼️ Фото с Pixabay")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено\n🎨 Цветной дизайн")
             await cb.message.delete()
         except asyncio.TimeoutError:
             await cb.message.edit_text("⏰ Долго. Поддержка: @ultimatepreza")
@@ -585,7 +656,6 @@ async def cancel_pay(cb: CallbackQuery, state: FSMContext):
 async def fallback(msg: Message):
     await msg.answer("🤔 Кнопки меню или /start", reply_markup=menu())
 
-# ===== ЗАПУСК =====
 async def main():
     log.info("🚀 Запуск...")
     if PIXABAY_KEY:
