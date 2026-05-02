@@ -79,7 +79,7 @@ async def get_token():
                 async with s.post(
                     "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
                     headers={"Authorization": f"Basic {GIGA_AUTH}", "RqUID": str(uuid.uuid4())},
-                    data={"scope": "GIGACHAT_API_PERS"}, ssl=True, timeout=30
+                    data={"scope": "GIGACHAT_API_PERS"}, ssl=False, timeout=30
                 ) as r:
                     if r.status == 200:
                         _token = (await r.json())["access_token"]
@@ -125,7 +125,7 @@ async def ask_ai(text):
                             {"role": "user", "content": text}
                         ],
                         "temperature": 0.75, "max_tokens": 3500
-                    }, ssl=True, timeout=90
+                    }, ssl=False, timeout=90
                 ) as r:
                     if r.status == 200:
                         return (await r.json())["choices"][0]["message"]["content"]
@@ -157,7 +157,6 @@ async def get_content(topic, n):
     resp = await ask_ai(prompt)
     if not resp: return None
     
-    # Находим JSON в ответе
     s = resp.find('{')
     e = resp.rfind('}')
     if s == -1 or e == -1:
@@ -196,7 +195,6 @@ async def make_pptx(data):
     prs.slide_width = SW
     prs.slide_height = SH
     
-    # Готовим картинки параллельно
     tasks = []
     for s in slides:
         if s.get("type") == "content":
@@ -242,7 +240,6 @@ async def make_pptx(data):
                 img = images[i]
                 if isinstance(img, BytesIO):
                     sl.shapes.add_picture(img, img_x, Emu(1371600), width=IW)
-                    # подпись
                     cap = sl.shapes.add_textbox(img_x, Emu(5300000), IW, Emu(548640))
                     cap.text_frame.text = s.get("caption", "")
                     cap.text_frame.paragraphs[0].font.size = Pt(10)
@@ -392,7 +389,7 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
             await cb.message.edit_text("⏰ Слишком долго. Напиши в поддержку.")
         except Exception as e:
             log.error(f"Ошибка: {e}")
-            await cb.message.edit_text("❌ Ошибка. Поддержка: @prezacoolbot")
+            await cb.message.edit_text("❌ Ошибка. Поддержка: @ultimatepreza")
         await state.clear()
     elif p.status == "pending":
         await cb.answer("⏳ Жди 30 секунд и нажми ещё раз", show_alert=True)
