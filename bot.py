@@ -53,12 +53,12 @@ Configuration.account_id = YOOKASSA_ID
 Configuration.secret_key = YOOKASSA_KEY
 
 # ===== РАЗМЕРЫ СЛАЙДА (13.333" x 7.5") =====
-SW = Emu(12192000)   # ширина слайда
-SH = Emu(6858000)    # высота слайда
-MG = Emu(365760)     # отступ от края 0.4"
-GP = Emu(274320)     # зазор между текстом и картинкой 0.3"
-IW = Emu(4937760)    # ширина картинки 5.4"
-TW = SW - IW - GP - MG*2  # ширина текста (автовычисление)
+SW = Emu(12192000)
+SH = Emu(6858000)
+MG = Emu(365760)
+GP = Emu(274320)
+IW = Emu(4937760)
+TW = SW - IW - GP - MG*2
 
 # ===== СОСТОЯНИЯ =====
 class State(StatesGroup):
@@ -143,11 +143,14 @@ async def get_content(topic, n):
 Слайды 2-{n-1}: Содержательные слайды. Для КАЖДОГО напиши:
   - "title": Яркий заголовок (5-9 слов), вызывающий интерес
   - "text": 3-4 развёрнутых предложения с КОНКРЕТНЫМИ ПРИМЕРАМИ ИЗ ЖИЗНИ, цифрами, фактами
-  - "image_prompt": Короткое описание картинки НА АНГЛИЙСКОМ ЯЗЫКЕ (3-6 слов), которая ИЛЛЮСТРИРУЕТ ТЕКСТ этого слайда.
-    Например: "digital brain learning from mistakes"
-    или: "neural network recognizing cat photo"
-    или: "self driving car on highway"
-    или: "quantum particles interacting abstract"
+  - "image_prompt": Короткое описание картинки НА АНГЛИЙСКОМ ЯЗЫКЕ (3-6 слов).
+    ВАЖНО: Каждый image_prompt должен быть УНИКАЛЬНЫМ и соответствовать тексту слайда.
+    Примеры:
+    "colorful DNA double helix structure"
+    "microscope view of human cell"
+    "friendly bacteria in human gut"
+    "quantum wave function visualization"
+    "cartoon characters learning together"
 
 Слайд {n}: Список литературы (5 реальных книг/статей)
 
@@ -156,13 +159,11 @@ async def get_content(topic, n):
   "title": "Заголовок всей презентации",
   "slides": [
     {{"type": "title", "text": "Москва, 2026"}},
-    {{"type": "content", "title": "Как нейросеть учится на ошибках?", "text": "Нейросеть учится как ребёнок. Сначала она путает кошку с собакой, но после 10 000 примеров находит закономерности. Алгоритм обратного распространения ошибки работает как строгий учитель, исправляющий каждую неточность.", "image_prompt": "robot child learning from teacher"}},
+    {{"type": "content", "title": "Заголовок слайда", "text": "Текст с примерами...", "image_prompt": "english description of image"}},
     ...
     {{"type": "references", "text": "1. Книга 1\\n2. Книга 2\\n..."}}
   ]
 }}
-
-ВАЖНО: image_prompt должен быть РАЗНЫМ для каждого слайда и соответствовать его тексту!
 """
     resp = await ask_ai(prompt, temp=0.8)
     if not resp: return None
@@ -184,34 +185,60 @@ async def get_content(topic, n):
     
     return data
 
-# ===== КАРТИНКИ =====
+# ===== КАРТИНКИ (ИСПРАВЛЕНО!) =====
 async def get_image(prompt):
-    """Генерирует картинку по текстовому описанию."""
+    """Генерирует картинку через Pollinations AI с повторными попытками."""
     if not prompt:
         return None
     
     # Очищаем промпт
-    safe = re.sub(r'[^a-zA-Z0-9\s]', '', prompt).strip().replace(' ', '%20')
-    if not safe:
-        safe = "abstract%20presentation%20background"
+    safe = re.sub(r'[^a-zA-Z0-9\s]', '', prompt).strip()
+    if not safe or len(safe) < 3:
+        safe = "abstract presentation background"
     
-    # Добавляем случайный seed для разнообразия
+    # Кодируем для URL
+    encoded = safe.replace(' ', '%20')
     seed = str(uuid.uuid4().int)[:8]
     
+    # Пробуем ДВА разных URL для надёжности
+    urls = [
+        f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}",
+        f"https://pollinations.ai/p/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
+    ]
+    
+    for url in urls:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=25) as r:
+                    if r.status == 200:
+                        content_type = r.headers.get('Content-Type', '')
+                        if 'image' in content_type or len(await r.read()) > 1000:
+                            return BytesIO(await r.read() if hasattr(r, '_body') else (await r.read()))
+                        
+                        # Второй вариант чтения
+                        data = await r.read()
+                        if len(data) > 1000:
+                            return BytesIO(data)
+        except Exception as e:
+            log.warning(f"URL {url[:50]}... не сработал: {e}")
+            continue
+    
+    # Если не сработало — пробуем Unsplash (заглушка)
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
-                f"https://image.pollinations.ai/prompt/{safe}",
-                params={"width": 1024, "height": 768, "nologo": "true", "seed": seed},
-                timeout=20
+                f"https://source.unsplash.com/1024x768/?{encoded}",
+                timeout=15
             ) as r:
                 if r.status == 200:
                     return BytesIO(await r.read())
-    except Exception as e:
-        log.warning(f"Картинка: {e}")
+    except:
+        pass
+    
+    log.warning(f"Все сервисы картинок не ответили для: {safe[:50]}")
     return None
 
-# ===== PPTX С ПРАВИЛЬНОЙ ВЕРСТКОЙ =====
+# ===== PPTX =====
 async def make_pptx(data):
     slides = data.get("slides", [])
     if not slides:
@@ -221,7 +248,7 @@ async def make_pptx(data):
     prs.slide_width = SW
     prs.slide_height = SH
 
-    # Готовим картинки ПАРАЛЛЕЛЬНО (быстрее)
+    # Готовим картинки параллельно
     tasks = []
     for s in slides:
         if s.get("type") == "content":
@@ -233,116 +260,98 @@ async def make_pptx(data):
 
     for i, s in enumerate(slides):
         stype = s.get("type", "content")
-        # Четные слайды — картинка СЛЕВА, нечетные — картинка СПРАВА
         img_on_left = (i % 2 == 0)
 
         try:
             if stype == "title":
-                # ТИТУЛЬНЫЙ СЛАЙД
                 sl = prs.slides.add_slide(prs.slide_layouts[0])
                 sl.shapes.title.text = data.get("title", "Презентация")
-                # Подзаголовок
                 if len(sl.placeholders) > 1:
                     sl.placeholders[1].text = s.get("text", f"Москва, {datetime.now().year}")
-                    # Центрируем и делаем красивее
                     sl.placeholders[1].text_frame.paragraphs[0].font.size = Pt(20)
 
             elif stype == "references":
-                # СПИСОК ЛИТЕРАТУРЫ
                 sl = prs.slides.add_slide(prs.slide_layouts[1])
                 sl.shapes.title.text = "📚 Список литературы"
-                # Текст литературы
                 if len(sl.placeholders) > 1:
                     sl.placeholders[1].text = s.get("text", "")
-                    # Уменьшаем шрифт
                     for p in sl.placeholders[1].text_frame.paragraphs:
                         p.font.size = Pt(14)
 
             else:
-                # СОДЕРЖАТЕЛЬНЫЙ СЛАЙД
                 sl = prs.slides.add_slide(prs.slide_layouts[1])
-                
-                # Заголовок слайда
                 sl.shapes.title.text = s.get("title", "Информация")
-                title_font = sl.shapes.title.text_frame.paragraphs[0].font
-                title_font.size = Pt(28)
-                title_font.bold = True
+                sl.shapes.title.text_frame.paragraphs[0].font.size = Pt(28)
+                sl.shapes.title.text_frame.paragraphs[0].font.bold = True
 
-                # === ТЕКСТ СЛАЙДА ===
                 text = s.get("text", "")
                 
                 if img_on_left:
-                    # Картинка слева → текст справа
                     txt_left = MG + IW + GP
                     img_left = MG
                 else:
-                    # Картинка справа → текст слева
                     txt_left = MG
                     img_left = SW - IW - MG
 
-                # Добавляем текстовое поле
-                txt_top = Emu(1600000)     # 1.75" от верха
-                txt_height = Emu(4500000)  # 4.9" высота
+                txt_top = Emu(1600000)
+                txt_height = Emu(4500000)
                 
-                txBox = sl.shapes.add_textbox(
-                    txt_left, txt_top, TW, txt_height
-                )
+                txBox = sl.shapes.add_textbox(txt_left, txt_top, TW, txt_height)
                 tf = txBox.text_frame
                 tf.word_wrap = True
                 tf.text = text
                 
-                # Настройка шрифта текста
                 for p in tf.paragraphs:
                     p.font.size = Pt(15)
                     p.space_after = Pt(8)
                     p.alignment = PP_ALIGN.LEFT
 
-                # === КАРТИНКА ===
+                # Картинка
+                img_top = Emu(1800000)
                 img = images[i]
-                img_top = Emu(1800000)  # 2.0" от верха
                 
                 if isinstance(img, BytesIO):
-                    # Вставляем картинку
-                    sl.shapes.add_picture(img, img_left, img_top, width=IW)
-                    
-                    # Подпись под картинкой
-                    caption = s.get("image_prompt", s.get("caption", "Иллюстрация"))
-                    cap_top = img_top + Emu(3700000)  # под картинкой
-                    cap = sl.shapes.add_textbox(
-                        img_left, cap_top, IW, Emu(400000)
-                    )
-                    cap.text_frame.text = caption
-                    for p in cap.text_frame.paragraphs:
-                        p.font.size = Pt(9)
-                        p.font.italic = True
-                        p.alignment = PP_ALIGN.CENTER
+                    try:
+                        sl.shapes.add_picture(img, img_left, img_top, width=IW)
+                        
+                        # Подпись
+                        caption = s.get("image_prompt", s.get("caption", "Иллюстрация"))
+                        cap_top = img_top + Emu(3700000)
+                        cap = sl.shapes.add_textbox(img_left, cap_top, IW, Emu(400000))
+                        cap.text_frame.text = caption
+                        for p in cap.text_frame.paragraphs:
+                            p.font.size = Pt(9)
+                            p.font.italic = True
+                            p.alignment = PP_ALIGN.CENTER
+                    except Exception as e:
+                        log.error(f"Вставка картинки {i}: {e}")
+                        _add_image_placeholder(sl, img_left, img_top, IW)
                 else:
-                    # Заглушка если картинка не загрузилась
-                    shape = sl.shapes.add_shape(
-                        1, img_left, img_top, IW, Emu(3600000)  # Прямоугольник
-                    )
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (240, 240, 245)
-                    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 190)
-                    shape.line.width = Pt(1)
-                    
-                    # Текст в заглушке
-                    pltf = shape.text_frame
-                    pltf.text = "🎨\nИллюстрация\nзагружается..."
-                    for p in pltf.paragraphs:
-                        p.alignment = PP_ALIGN.CENTER
-                        p.font.size = Pt(12)
-                        p.font.color.rgb = type(p.font.color).rgb = (130, 130, 150)
+                    _add_image_placeholder(sl, img_left, img_top, IW)
 
         except Exception as e:
             log.error(f"Слайд {i}: {e}")
             continue
 
-    # Сохраняем
     buf = BytesIO()
     prs.save(buf)
     buf.seek(0)
     return buf
+
+def _add_image_placeholder(slide, left, top, width):
+    """Красивая заглушка если картинка не загрузилась."""
+    shape = slide.shapes.add_shape(1, left, top, width, Emu(3600000))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = type(shape.fill.fore_color).rgb = (245, 245, 250)
+    shape.line.color.rgb = type(shape.line.color).rgb = (180, 180, 200)
+    shape.line.width = Pt(1)
+    
+    tf = shape.text_frame
+    tf.text = "🖼️\nИллюстрация\nк слайду"
+    for p in tf.paragraphs:
+        p.alignment = PP_ALIGN.CENTER
+        p.font.size = Pt(13)
+        p.font.color.rgb = type(p.font.color).rgb = (140, 140, 160)
 
 # ===== ИМЯ ФАЙЛА =====
 def filename(topic):
@@ -352,23 +361,18 @@ def filename(topic):
     name = name.replace(' ', '_') or "presentation"
     return f"{name}.pptx"
 
-# ===== ОТПРАВКА ФАЙЛА =====
+# ===== ОТПРАВКА =====
 async def send_file(msg, data, name, caption):
     for t in range(3):
         try:
             return await msg.answer_document(
-                BufferedInputFile(data, name),
-                caption=caption,
-                parse_mode="Markdown"
+                BufferedInputFile(data, name), caption=caption, parse_mode="Markdown"
             )
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
-        except Exception as e:
-            if t == 2:
-                raise e
-            await asyncio.sleep(2)
+        except: await asyncio.sleep(2)
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ОБРАБОТЧИКИ ==========
 
 @dp.message(Command("start"))
 async def start(msg: Message, state: FSMContext):
@@ -376,41 +380,23 @@ async def start(msg: Message, state: FSMContext):
     admin = "🆓 Бесплатный доступ!\n" if msg.from_user.id == ADMIN_ID else ""
     await msg.answer(
         f"🎓 *Привет! Я создаю презентации с ИИ!*\n\n"
-        f"✨ Умный текст\n"
-        f"🎨 Уникальные картинки\n"
-        f"📊 PowerPoint файл\n\n"
-        f"💰 Цена: {PRICE}₽\n"
-        f"{admin}\n"
-        f"👇 Нажми кнопку:",
-        parse_mode="Markdown",
-        reply_markup=menu()
+        f"✨ Умный текст\n🎨 Уникальные картинки\n📊 PowerPoint\n\n"
+        f"💰 Цена: {PRICE}₽\n{admin}\n👇 Кнопка:",
+        parse_mode="Markdown", reply_markup=menu()
     )
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(msg: Message):
     await msg.answer(
-        "📌 *Как создать презентацию:*\n\n"
-        "1️⃣ Нажми «Создать презентацию»\n"
-        "2️⃣ Напиши тему и количество\n"
-        "   *Пример:* `Нейросети 8`\n"
-        "3️⃣ Оплати 100₽ (админам бесплатно)\n"
-        "4️⃣ Получи готовый файл!\n\n"
-        "💡 *Слайдов:* от 4 до 12\n"
-        "🎨 Картинки подбираются под текст\n"
-        "📚 Список литературы в конце",
+        "📌 *Как создать:*\n\n1. Нажми «Создать»\n2. Напиши тему и число (4-12)\n"
+        "3. Оплати 100₽\n4. Получи файл\n\nПример: `Нейросети 8`",
         parse_mode="Markdown"
     )
 
 @dp.message(F.text == "💰 Цена")
 async def price_cmd(msg: Message):
     await msg.answer(
-        f"💎 *{PRICE}₽ за презентацию*\n\n"
-        f"✅ Умный текст от GigaChat\n"
-        f"✅ Уникальные AI-картинки\n"
-        f"✅ 5-12 слайдов\n"
-        f"✅ Список литературы\n"
-        f"✅ PowerPoint файл\n\n"
-        f"💳 Оплата: карты, СБП",
+        f"💎 *{PRICE}₽*\n\n✅ Текст GigaChat\n✅ AI-картинки\n✅ 5-12 слайдов\n✅ Литература\n💳 Оплата: карты, СБП",
         parse_mode="Markdown"
     )
 
@@ -419,40 +405,29 @@ async def start_create(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(State.topic)
     await msg.answer(
-        "✏️ *Напиши тему и количество слайдов*\n\n"
-        "*Примеры:*\n"
-        "`Нейросети 8`\n"
-        "`История интернета 6`\n"
-        "`Квантовая физика 5`\n"
-        "`Солнечная система 4`\n\n"
-        "❌ Отмена: /start",
+        "✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История 6`\n`Квантовая физика 5`",
         parse_mode="Markdown"
     )
 
 @dp.message(StateFilter(State.topic))
 async def got_topic(msg: Message, state: FSMContext):
     text = msg.text.strip()
-    
-    # Проверка на команду
     if text.startswith('/'):
         await state.clear()
         return await start(msg, state)
     
     parts = text.split()
     if len(parts) < 2:
-        return await msg.answer("❌ Напиши: Тема Число\nПример: `Нейросети 6`")
+        return await msg.answer("❌ Нужно: Тема Число\nПример: `Нейросети 6`")
     
     try:
         n = int(parts[-1])
         topic = " ".join(parts[:-1])
     except ValueError:
-        return await msg.answer("❌ Последнее слово должно быть числом!\nПример: `История 6`")
+        return await msg.answer("❌ Последнее слово — число!\nПример: `История 6`")
     
     if n < 4 or n > 12:
-        return await msg.answer("❌ Количество слайдов: от 4 до 12")
-    
-    if len(topic) > 200:
-        return await msg.answer("❌ Тема слишком длинная. Сократи.")
+        return await msg.answer("❌ От 4 до 12 слайдов")
     
     await state.update_data(topic=topic, num=n)
     
@@ -460,33 +435,24 @@ async def got_topic(msg: Message, state: FSMContext):
     if msg.from_user.id == ADMIN_ID:
         await state.clear()
         status = await msg.answer(f"🔄 Генерирую «{topic}», {n} слайдов...")
-        
         try:
-            # Шаг 1: получить контент
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
             if not data:
-                return await status.edit_text("❌ GigaChat не ответил. Попробуй другую тему.")
-            
-            await status.edit_text("🎨 Создаю слайды и рисую картинки...")
-            
-            # Шаг 2: собрать PPTX
+                return await status.edit_text("❌ GigaChat не ответил")
+            await status.edit_text("🎨 Создаю слайды...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=120)
             if not pptx:
-                return await status.edit_text("❌ Не удалось собрать файл.")
-            
-            # Шаг 3: отправить
+                return await status.edit_text("❌ Ошибка сборки")
             await send_file(msg, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 Тема: {topic}\n📊 Слайдов: {n}\n🎨 Уникальные картинки")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов")
             await status.delete()
-            
         except asyncio.TimeoutError:
-            await status.edit_text("⏰ Превышено время. Упрости тему или уменьши число слайдов.")
+            await status.edit_text("⏰ Долго. Упрости тему.")
         except Exception as e:
             log.error(f"Ошибка: {e}")
-            await status.edit_text("❌ Ошибка. Напиши /start и попробуй снова.")
-    
-    # ПЛАТНЫЙ ПОЛЬЗОВАТЕЛЬ
+            await status.edit_text("❌ Ошибка. /start")
     else:
+        # ПЛАТНО
         try:
             payment = Payment.create({
                 "amount": {"value": f"{PRICE}.00", "currency": "RUB"},
@@ -495,12 +461,7 @@ async def got_topic(msg: Message, state: FSMContext):
                     "return_url": f"https://t.me/{(await bot.get_me()).username}"
                 },
                 "description": f"Презентация «{topic[:50]}», {n} слайдов",
-                "metadata": {
-                    "uid": msg.from_user.id,
-                    "topic": topic,
-                    "n": n,
-                    "delivered": False
-                },
+                "metadata": {"uid": msg.from_user.id, "topic": topic, "n": n},
                 "capture": True,
                 "receipt": {
                     "customer": {"email": f"{msg.from_user.id}@t.me"},
@@ -514,30 +475,21 @@ async def got_topic(msg: Message, state: FSMContext):
                     }]
                 }
             })
-            
             await state.update_data(pid=payment.id)
             await state.set_state(State.payment)
-            
             await msg.answer(
-                f"💎 *Ваш заказ*\n\n"
-                f"📌 Тема: {topic}\n"
-                f"📊 Слайдов: {n}\n"
-                f"💰 Сумма: *{PRICE}₽*\n\n"
-                f"👇 Нажмите для оплаты:",
-                parse_mode="Markdown",
-                reply_markup=pay_kb(payment.confirmation.confirmation_url)
+                f"💎 *Заказ*\n📌 {topic}\n📊 {n} слайдов\n💰 *{PRICE}₽*\n\n👇 Оплатить:",
+                parse_mode="Markdown", reply_markup=pay_kb(payment.confirmation.confirmation_url)
             )
-            
         except Exception as e:
             log.error(f"Платёж: {e}")
-            await msg.answer("❌ Ошибка платёжной системы. Попробуй позже.")
+            await msg.answer("❌ Ошибка платежа.")
             await state.clear()
 
 @dp.callback_query(F.data == "paid")
 async def check_pay(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     pid = d.get("pid")
-    
     if not pid:
         await cb.answer("❌ Платёж не найден")
         return
@@ -545,75 +497,49 @@ async def check_pay(cb: CallbackQuery, state: FSMContext):
     try:
         p = Payment.find_one(pid)
     except:
-        await cb.answer("❌ Ошибка проверки платежа")
+        await cb.answer("❌ Ошибка проверки")
         return
     
     if p.status == "succeeded":
-        # Проверка, не выдали ли уже
-        if p.metadata and p.metadata.get("delivered"):
-            await cb.answer("⚠️ Презентация уже была отправлена!", show_alert=True)
-            await state.clear()
-            return
-        
         topic = d.get("topic") or (p.metadata or {}).get("topic")
         n = d.get("num") or (p.metadata or {}).get("n")
         
-        if not topic or not n:
-            await cb.message.edit_text("❌ Данные утеряны. Напиши /start")
-            await state.clear()
-            return
-        
-        await cb.message.edit_text(f"✅ *Оплачено!*\n🔄 Генерирую «{topic}»...", parse_mode="Markdown")
-        
+        await cb.message.edit_text(f"✅ Оплачено! Создаю «{topic}»...")
         try:
             data = await asyncio.wait_for(get_content(topic, n), timeout=120)
             if not data:
-                return await cb.message.edit_text("❌ Ошибка генерации. Деньги вернутся автоматически.")
-            
-            await cb.message.edit_text("🎨 Собираю слайды...")
+                return await cb.message.edit_text("❌ Ошибка. Деньги вернутся.")
+            await cb.message.edit_text("🎨 Собираю...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=120)
-            
             if not pptx:
-                return await cb.message.edit_text("❌ Ошибка сборки. Деньги вернутся.")
-            
+                return await cb.message.edit_text("❌ Ошибка сборки.")
             await send_file(cb.message, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено\n\nСпасибо за покупку! 🎉")
+                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено")
             await cb.message.delete()
-            
-            # Отмечаем как выданное
-            try:
-                # ЮKassa не даёт менять metadata, но можно пометить в логах
-                log.info(f"Выдана презентация по платежу {pid}")
-            except:
-                pass
-            
         except asyncio.TimeoutError:
-            await cb.message.edit_text("⏰ Превышено время. Обратись в поддержку: @ultimatepreza")
+            await cb.message.edit_text("⏰ Долго. Поддержка: @ultimatepreza")
         except Exception as e:
-            log.error(f"Ошибка выдачи: {e}")
+            log.error(f"Ошибка: {e}")
             await cb.message.edit_text("❌ Ошибка. Поддержка: @ultimatepreza")
-        
         await state.clear()
-        
     elif p.status == "pending":
-        await cb.answer("⏳ Платёж обрабатывается. Нажми ещё раз через 30 секунд.", show_alert=True)
+        await cb.answer("⏳ Жди 30 сек", show_alert=True)
     else:
-        await cb.answer(f"❌ Статус: {p.status}. Создай новый заказ через /start", show_alert=True)
+        await cb.answer(f"❌ Статус: {p.status}", show_alert=True)
         await state.clear()
 
 @dp.callback_query(F.data == "cancel")
 async def cancel_pay(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("❌ Заказ отменён. /start для нового.")
-    await cb.answer()
+    await cb.message.edit_text("❌ Отменено. /start")
 
 @dp.message()
 async def fallback(msg: Message):
-    await msg.answer("🤔 Используй кнопки меню или напиши /start", reply_markup=menu())
+    await msg.answer("🤔 Кнопки меню или /start", reply_markup=menu())
 
 # ===== ЗАПУСК =====
 async def main():
-    log.info("🚀 Бот запускается...")
+    log.info("🚀 Запуск...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
