@@ -154,7 +154,7 @@ async def ask_ai(text, temp=0.75):
                     json={
                         "model": "GigaChat",
                         "messages": [
-                            {"role": "system", "content": "Ты — профессор. Отвечаешь ТОЛЬКО валидным JSON без комментариев."},
+                            {"role": "system", "content": "You are a professor. You respond ONLY with valid JSON. No comments."},
                             {"role": "user", "content": text}
                         ],
                         "temperature": temp, "max_tokens": 3500
@@ -168,111 +168,124 @@ async def ask_ai(text, temp=0.75):
             await asyncio.sleep(1)
     return None
 
+# ===== НОВЫЙ ПРОМПТ (ДВА ШАГА) =====
 async def get_content(topic, n):
-    prompt = f"""Создай учебную презентацию на тему "{topic}". Ровно {n} слайдов.
+    # Шаг 1: Получаем структуру презентации
+    prompt1 = f"""Create an educational presentation about "{topic}". Exactly {n} slides.
 
-Слайд 1: Титульный
-Слайды 2-{n-1}: Содержательные
-Слайд {n}: Список литературы
+Slide 1: Title slide
+Slides 2-{n-1}: Content slides. For EACH slide provide:
+  - "title": Engaging title (5-9 words)
+  - "text": 3-4 sentences with FACTS, numbers, examples
+  - "image_topic": WHAT THIS SLIDE IS ABOUT (1 sentence in English describing the visual subject)
+    Example: "Russian Tsar Ivan the Terrible portrait 16th century"
+    Example: "ancient monastery Trinity Lavra Sergiyev Posad architecture"
+    Example: "DNA double helix structure molecular biology"
 
-Для КАЖДОГО содержательного слайда:
-- "title": заголовок (5-9 слов, по теме)
-- "text": 3-4 предложения с КОНКРЕТНЫМИ фактами, примерами, цифрами
-- "search_query": 2-4 слова НА АНГЛИЙСКОМ для поиска фото.
-  ВАЖНЕЙШЕЕ ПРАВИЛО: описывай ТО, ЧТО МОЖНО СФОТОГРАФИРОВАТЬ.
-  ✓ Правильно: "Kremlin red brick walls Moscow"
-  ✓ Правильно: "ancient manuscript parchment writing"
-  ✓ Правильно: "neuron microscope brain cell"
-  ✗ Неправильно: "опричнина террор бояре" (нельзя сфоткать)
-  ✗ Неправильно: "culture education development" (слишком абстрактно)
-  
-  Добавляй уточняющие слова: building, monument, painting, portrait, sculpture, 
-  landscape, cathedral, manuscript, map, artifact, laboratory, microscope.
+Slide {n}: References (5 real books/articles)
 
-Формат ответа — ТОЛЬКО JSON:
+Return ONLY JSON:
 {{"title":"...","slides":[
-  {{"type":"title","text":"Москва, 2026"}},
-  {{"type":"content","title":"...","text":"...","search_query":"english specific searchable words"}},
-  {{"type":"references","text":"1. ...\\n2. ...\\n3. ...\\n4. ...\\n5. ..."}}
+  {{"type":"title","text":"Moscow, 2026"}},
+  {{"type":"content","title":"...","text":"...","image_topic":"english description of visual subject"}},
+  {{"type":"references","text":"1. ...\\n2. ..."}}
 ]}}"""
-    
-    resp = await ask_ai(prompt, temp=0.7)
-    if not resp:
-        return None
-    data = extract_json(resp)
-    if not data:
-        resp2 = await ask_ai(prompt, temp=0.5)
-        if resp2:
-            data = extract_json(resp2)
-    return data if data and "slides" in data else None
 
-# ===== ПОИСК КАРТИНОК: Unsplash → Pixabay → Pollinations =====
+    resp1 = await ask_ai(prompt1, temp=0.7)
+    if not resp1:
+        return None
+    
+    data = extract_json(resp1)
+    if not data:
+        resp1 = await ask_ai(prompt1, temp=0.5)
+        if resp1:
+            data = extract_json(resp1)
+    
+    if not data or "slides" not in data:
+        return None
+
+    # Шаг 2: Для каждого слайда генерируем КОНКРЕТНЫЙ поисковый запрос
+    slides = data["slides"]
+    for i, s in enumerate(slides):
+        if s.get("type") == "content":
+            image_topic = s.get("image_topic", "")
+            if image_topic:
+                search_prompt = f"""Convert this description into a SHORT image search query (2-5 words, English only).
+Description: "{image_topic}"
+
+Rules:
+- Use ONLY concrete nouns: people, buildings, objects, animals, nature
+- Add type words: portrait, painting, photo, monument, cathedral, manuscript
+- Example: "Tsar Ivan portrait painting"
+- Example: "Trinity Lavra monastery Russia"
+- Example: "DNA helix structure"
+
+Return ONLY the search query, nothing else."""
+
+                search_query = await ask_ai(search_prompt, temp=0.3)
+                if search_query:
+                    # Очищаем ответ от кавычек и лишнего
+                    sq = search_query.strip().strip('"').strip("'")
+                    # Ограничиваем длину
+                    sq = ' '.join(sq.split()[:6])
+                    s["search_query"] = sq
+                    log.info(f"Слайд {i}: '{s['title']}' → '{sq}'")
+                else:
+                    # Fallback — используем image_topic
+                    s["search_query"] = ' '.join(image_topic.split()[:5])
+
+    return data
+
+# ===== ПОИСК КАРТИНОК =====
 
 async def _download(url: str) -> Optional[BytesIO]:
-    """Скачивает фото по URL."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=20) as r:
                 if r.status == 200:
                     data = await r.read()
-                    if len(data) > 2000:  # Минимум 2KB
+                    if len(data) > 2000:
                         return BytesIO(data)
     except:
         pass
     return None
 
 async def search_unsplash(query: str) -> Optional[BytesIO]:
-    """Поиск фото на Unsplash."""
     if not UNSPLASH_KEY or not query:
         return None
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
                 "https://api.unsplash.com/search/photos",
-                params={
-                    "query": query,
-                    "per_page": 5,
-                    "orientation": "landscape",
-                    "client_id": UNSPLASH_KEY
-                },
+                params={"query": query, "per_page": 10, "orientation": "landscape", "client_id": UNSPLASH_KEY},
                 timeout=15
             ) as r:
                 if r.status == 200:
                     data = await r.json()
                     results = data.get("results", [])
                     if results:
-                        # Берём случайное фото из топ-5
                         photo = random.choice(results)
                         url = photo["urls"].get("regular") or photo["urls"].get("small")
                         if url:
                             img = await _download(url)
                             if img:
-                                desc = photo.get("description") or photo.get("alt_description") or query
-                                log.info(f"✅ Unsplash: {desc[:50]}")
+                                log.info(f"✅ Unsplash: {query[:50]}")
                                 return img
-    except Exception as e:
-        log.warning(f"Unsplash: {e}")
+    except:
+        pass
     return None
 
 async def search_pixabay(query: str) -> Optional[BytesIO]:
-    """Поиск фото на Pixabay."""
     if not PIXABAY_KEY or not query:
         return None
     try:
         async with aiohttp.ClientSession() as s:
-            # Сначала ищем фото
             for img_type in ["photo", "illustration"]:
                 async with s.get(
                     "https://pixabay.com/api/",
-                    params={
-                        "key": PIXABAY_KEY,
-                        "q": query,
-                        "per_page": 5,
-                        "orientation": "horizontal",
-                        "min_width": 1024,
-                        "safesearch": "true",
-                        "image_type": img_type
-                    },
+                    params={"key": PIXABAY_KEY, "q": query, "per_page": 10,
+                            "orientation": "horizontal", "min_width": 1024,
+                            "safesearch": "true", "image_type": img_type},
                     timeout=15
                 ) as r:
                     if r.status == 200:
@@ -282,62 +295,43 @@ async def search_pixabay(query: str) -> Optional[BytesIO]:
                             url = random.choice(hits)["largeImageURL"]
                             img = await _download(url)
                             if img:
-                                log.info(f"✅ Pixabay ({img_type}): {query[:50]}")
+                                log.info(f"✅ Pixabay: {query[:50]}")
                                 return img
-    except Exception as e:
-        log.warning(f"Pixabay: {e}")
-    return None
-
-async def generate_pollinations(query: str) -> Optional[BytesIO]:
-    """Генерация картинки через Pollinations AI."""
-    if not query:
-        return None
-    safe = re.sub(r'[^a-zA-Z0-9\s]', '', query).strip()
-    if not safe or len(safe) < 3:
-        safe = "educational presentation"
-    
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"https://image.pollinations.ai/prompt/{safe.replace(' ', '%20')}",
-                params={"width": 1024, "height": 768, "nologo": "true", "seed": str(random.randint(1, 99999))},
-                timeout=25
-            ) as r:
-                if r.status == 200:
-                    data = await r.read()
-                    if len(data) > 2000:
-                        log.info(f"✅ Pollinations: {safe[:50]}")
-                        return BytesIO(data)
-    except Exception as e:
-        log.warning(f"Pollinations: {e}")
+    except:
+        pass
     return None
 
 async def get_image(query: str) -> Optional[BytesIO]:
-    """
-    Три уровня поиска картинок:
-    1. Unsplash (реальные фото)
-    2. Pixabay (фото + иллюстрации)
-    3. Pollinations AI (генерация)
-    """
     if not query:
-        query = "educational presentation background"
+        return None
     
-    # Уровень 1: Unsplash
+    # 1. Unsplash
     img = await search_unsplash(query)
-    if img:
-        return img
+    if img: return img
     
-    # Уровень 2: Pixabay
+    # 2. Pixabay
     img = await search_pixabay(query)
-    if img:
-        return img
+    if img: return img
     
-    # Уровень 3: Pollinations
-    img = await generate_pollinations(query)
-    if img:
-        return img
+    # 3. Pollinations
+    safe = re.sub(r'[^a-zA-Z0-9\s]', '', query).strip()
+    if safe:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"https://image.pollinations.ai/prompt/{safe.replace(' ', '%20')}",
+                    params={"width": 1024, "height": 768, "nologo": "true", "seed": str(random.randint(1, 99999))},
+                    timeout=25
+                ) as r:
+                    if r.status == 200:
+                        data = await r.read()
+                        if len(data) > 2000:
+                            log.info(f"✅ Pollinations: {safe[:50]}")
+                            return BytesIO(data)
+        except:
+            pass
     
-    log.warning(f"❌ Все сервисы не дали результат для: {query[:60]}")
+    log.warning(f"❌ Нет фото: {query[:60]}")
     return None
 
 # ===== PPTX =====
@@ -350,7 +344,6 @@ async def make_pptx(data):
     prs.slide_width = SW
     prs.slide_height = SH
 
-    # Параллельная загрузка картинок
     tasks = []
     for s in slides:
         if s.get("type") == "content":
@@ -410,21 +403,11 @@ async def make_pptx(data):
                 if isinstance(img, BytesIO):
                     try:
                         sl.shapes.add_picture(img, img_left, img_top, width=IW)
-                        # Подпись
-                        caption_text = s.get("search_query", "").replace("_", " ").title()
-                        cap = sl.shapes.add_textbox(img_left, Emu(5500000), IW, Emu(400000))
-                        cap.text_frame.text = caption_text
-                        for p in cap.text_frame.paragraphs:
-                            p.font.size = Pt(9)
-                            p.font.italic = True
-                            p.alignment = PP_ALIGN.CENTER
-                    except Exception as e:
-                        log.error(f"Вставка картинки {i}: {e}")
-                # Если нет картинки — слайд без неё (только текст)
+                    except:
+                        pass
 
         except Exception as e:
             log.error(f"Слайд {i}: {e}")
-            continue
 
     buf = BytesIO()
     prs.save(buf)
@@ -438,7 +421,6 @@ def filename(topic):
         name = name[:30].rsplit(' ', 1)[0]
     return f"{name.replace(' ', '_') or 'presentation'}.pptx"
 
-# ===== ОТПРАВКА =====
 async def send_file(msg, data, name, caption):
     for t in range(3):
         try:
@@ -450,52 +432,27 @@ async def send_file(msg, data, name, caption):
         except:
             await asyncio.sleep(2)
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОБРАБОТЧИКИ (без изменений) ==========
 
 @dp.message(Command("start"))
 async def start(msg: Message, state: FSMContext):
     await state.clear()
     admin = "🆓 Бесплатный доступ!\n" if msg.from_user.id == ADMIN_ID else ""
-    await msg.answer(
-        f"🎓 *PrezaBot — презентации с ИИ!*\n\n"
-        f"✨ Текст: GigaChat\n🖼️ Фото: Unsplash + Pixabay\n📊 PowerPoint\n\n"
-        f"💰 Цена: {PRICE}₽\n{admin}\n👇 Кнопка:",
-        parse_mode="Markdown", reply_markup=menu()
-    )
+    await msg.answer(f"🎓 *PrezaBot — презентации с ИИ!*\n\n✨ Текст: GigaChat\n🖼️ Фото: Unsplash + Pixabay\n📊 PowerPoint\n\n💰 Цена: {PRICE}₽\n{admin}\n👇 Кнопка:", parse_mode="Markdown", reply_markup=menu())
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(msg: Message):
-    await msg.answer(
-        "📌 *Как создать:*\n\n"
-        "1. Нажми «Создать»\n"
-        "2. Тема + количество (4-12)\n"
-        "3. Оплати 100₽ (админ — бесплатно)\n"
-        "4. Получи файл\n\n"
-        "Примеры: `Нейросети 8`, `История России 16 век 7`",
-        parse_mode="Markdown"
-    )
+    await msg.answer("📌 *Как:*\n1. «Создать»\n2. Тема Число (4-12)\n3. Оплатить\n4. Файл!\n\nПример: `Нейросети 8`", parse_mode="Markdown")
 
 @dp.message(F.text == "💰 Цена")
 async def price_cmd(msg: Message):
-    await msg.answer(
-        f"💎 *{PRICE}₽ за презентацию*\n\n"
-        f"✅ Текст GigaChat\n"
-        f"✅ Фото Unsplash/Pixabay\n"
-        f"✅ 5-12 слайдов\n"
-        f"✅ Список литературы\n\n"
-        f"💳 Карты, СБП, ЮMoney",
-        parse_mode="Markdown"
-    )
+    await msg.answer(f"💎 *{PRICE}₽*\n✅ Текст GigaChat\n✅ Фото Unsplash/Pixabay\n✅ Слайды 5-12\n✅ Литература", parse_mode="Markdown")
 
 @dp.message(F.text == "🎨 Создать презентацию")
 async def start_create(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(State.topic)
-    await msg.answer(
-        "✏️ *Тема и количество:*\n\n"
-        "`Нейросети 8`\n`История России 16 век 7`\n`Биология клетки 6`\n`Квантовая физика 5`",
-        parse_mode="Markdown"
-    )
+    await msg.answer("✏️ *Тема и количество:*\n\n`Нейросети 8`\n`История России 16 век 7`\n`Биология 6`", parse_mode="Markdown")
 
 @dp.message(StateFilter(State.topic))
 async def got_topic(msg: Message, state: FSMContext):
@@ -503,129 +460,102 @@ async def got_topic(msg: Message, state: FSMContext):
     if text.startswith('/'):
         await state.clear()
         return await start(msg, state)
-    
     parts = text.split()
     if len(parts) < 2:
-        return await msg.answer("❌ Формат: Тема Число\nПример: `Нейросети 6`")
-    
+        return await msg.answer("❌ Формат: Тема Число")
     try:
         n = int(parts[-1])
         topic = " ".join(parts[:-1])
     except ValueError:
-        return await msg.answer("❌ Число в конце!\nПример: `История 6`")
-    
+        return await msg.answer("❌ Число в конце!")
     if n < 4 or n > 12:
-        return await msg.answer("❌ От 4 до 12 слайдов")
+        return await msg.answer("❌ 4-12 слайдов")
     
     await state.update_data(topic=topic, num=n)
     
     if msg.from_user.id == ADMIN_ID:
         await state.clear()
-        status = await msg.answer(f"🔄 Генерирую «{topic}», {n} слайдов...")
+        status = await msg.answer(f"🔄 «{topic}», {n} слайдов...")
         try:
-            data = await asyncio.wait_for(get_content(topic, n), timeout=120)
+            data = await asyncio.wait_for(get_content(topic, n), timeout=150)
             if not data:
                 return await status.edit_text("❌ GigaChat не ответил")
-            await status.edit_text("🖼️ Подбираю фото (Unsplash → Pixabay → AI)...")
+            await status.edit_text("🖼️ Подбираю фото...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
             if not pptx:
                 return await status.edit_text("❌ Ошибка сборки")
-            await send_file(msg, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n🖼️ Unsplash + Pixabay")
+            await send_file(msg, pptx.getvalue(), filename(topic), f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов")
             await status.delete()
         except asyncio.TimeoutError:
-            await status.edit_text("⏰ Слишком долго. Упростите тему.")
+            await status.edit_text("⏰ Долго.")
         except Exception as e:
-            log.error(f"Ошибка: {e}")
-            await status.edit_text("❌ Ошибка. /start")
+            log.error(f"{e}")
+            await status.edit_text("❌ Ошибка")
     else:
         try:
             payment = Payment.create({
                 "amount": {"value": f"{PRICE}.00", "currency": "RUB"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": f"https://t.me/{(await bot.get_me()).username}"
-                },
+                "confirmation": {"type": "redirect", "return_url": f"https://t.me/{(await bot.get_me()).username}"},
                 "description": f"Презентация «{topic[:50]}», {n} слайдов",
                 "metadata": {"uid": msg.from_user.id, "topic": topic, "n": n},
                 "capture": True,
                 "receipt": {
                     "customer": {"email": f"{msg.from_user.id}@t.me"},
-                    "items": [{
-                        "description": f"Презентация «{topic[:30]}»",
-                        "quantity": "1",
-                        "amount": {"value": f"{PRICE}.00", "currency": "RUB"},
-                        "vat_code": "1",
-                        "payment_mode": "full_prepayment",
-                        "payment_subject": "service"
-                    }]
+                    "items": [{"description": f"Презентация «{topic[:30]}»", "quantity": "1", "amount": {"value": f"{PRICE}.00", "currency": "RUB"}, "vat_code": "1", "payment_mode": "full_prepayment", "payment_subject": "service"}]
                 }
             })
             await state.update_data(pid=payment.id)
             await state.set_state(State.payment)
-            await msg.answer(
-                f"💎 *Заказ*\n📌 {topic}\n📊 {n} слайдов\n💰 *{PRICE}₽*\n\n👇 Оплатить:",
-                parse_mode="Markdown", reply_markup=pay_kb(payment.confirmation.confirmation_url)
-            )
+            await msg.answer(f"💎 *Заказ*\n📌 {topic}\n📊 {n} слайдов\n💰 *{PRICE}₽*\n👇 Оплатить:", parse_mode="Markdown", reply_markup=pay_kb(payment.confirmation.confirmation_url))
         except Exception as e:
             log.error(f"Платёж: {e}")
-            await msg.answer("❌ Ошибка платежа.")
+            await msg.answer("❌ Ошибка")
             await state.clear()
 
 @dp.callback_query(F.data == "paid")
 async def check_pay(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     pid = d.get("pid")
-    if not pid:
-        return await cb.answer("❌ Платёж не найден")
+    if not pid: return await cb.answer("❌ Нет платежа")
     try:
         p = Payment.find_one(pid)
     except:
-        return await cb.answer("❌ Ошибка проверки")
-    
+        return await cb.answer("❌ Ошибка")
     if p.status == "succeeded":
         topic = d.get("topic") or (p.metadata or {}).get("topic")
         n = d.get("num") or (p.metadata or {}).get("n")
-        await cb.message.edit_text(f"✅ Оплачено! Генерирую «{topic}»...")
+        await cb.message.edit_text(f"✅ «{topic}»...")
         try:
-            data = await asyncio.wait_for(get_content(topic, n), timeout=120)
-            if not data:
-                return await cb.message.edit_text("❌ Ошибка генерации. Деньги вернутся.")
-            await cb.message.edit_text("🖼️ Подбираю фото...")
+            data = await asyncio.wait_for(get_content(topic, n), timeout=150)
+            if not data: return await cb.message.edit_text("❌ Ошибка генерации")
+            await cb.message.edit_text("🖼️ Фото...")
             pptx = await asyncio.wait_for(make_pptx(data), timeout=180)
-            if not pptx:
-                return await cb.message.edit_text("❌ Ошибка сборки.")
-            await send_file(cb.message, pptx.getvalue(), filename(topic),
-                          f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽ оплачено\n🖼️ Unsplash + Pixabay")
+            if not pptx: return await cb.message.edit_text("❌ Ошибка сборки")
+            await send_file(cb.message, pptx.getvalue(), filename(topic), f"✅ *Готово!*\n📌 {topic}\n📊 {n} слайдов\n💰 {PRICE}₽")
             await cb.message.delete()
         except asyncio.TimeoutError:
-            await cb.message.edit_text("⏰ Долго. Поддержка: @ultimatepreza")
+            await cb.message.edit_text("⏰ Долго")
         except Exception as e:
-            log.error(f"Ошибка: {e}")
-            await cb.message.edit_text("❌ Ошибка. Поддержка: @ultimatepreza")
+            log.error(f"{e}")
+            await cb.message.edit_text("❌ Ошибка")
         await state.clear()
     elif p.status == "pending":
-        await cb.answer("⏳ Платёж обрабатывается. Нажми ещё раз через 30 сек.", show_alert=True)
+        await cb.answer("⏳ Жди", show_alert=True)
     else:
-        await cb.answer(f"❌ Статус: {p.status}", show_alert=True)
+        await cb.answer(f"❌ {p.status}", show_alert=True)
         await state.clear()
 
 @dp.callback_query(F.data == "cancel")
 async def cancel_pay(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("❌ Отменено. /start для нового заказа.")
+    await cb.message.edit_text("❌ Отменено. /start")
 
 @dp.message()
 async def fallback(msg: Message):
-    await msg.answer("🤔 Используйте кнопки меню или /start", reply_markup=menu())
+    await msg.answer("🤔 Меню или /start", reply_markup=menu())
 
-# ===== ЗАПУСК =====
 async def main():
-    services = []
-    if UNSPLASH_KEY: services.append("Unsplash")
-    if PIXABAY_KEY: services.append("Pixabay")
-    services.append("Pollinations AI")
-    log.info(f"🚀 Запуск. Картинки: {' → '.join(services)}")
+    log.info("🚀 Запуск")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
